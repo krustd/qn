@@ -2,7 +2,7 @@
 
 Shell-aware command completion notifications.
 
-`qn` wraps shell commands and sends a completion notification — exit code, duration, working directory, and optionally stdout/stderr — to a configurable HTTP endpoint. Pair it with [QQ Task Notifier](https://github.com/krustd/qqbot) to get push notifications in QQ when long-running tasks finish.
+`qn` wraps shell commands and sends a completion notification — exit code, duration, working directory, and optionally stdout/stderr — to a configurable HTTP endpoint. Pair it with [QQ Task Notifier](https://github.com/krustd/qq-task-notifier) to get push notifications in QQ when long-running tasks finish.
 
 ## Installation
 
@@ -80,7 +80,7 @@ qn init-shell <fish|bash|zsh>
 `qn init` walks through setup interactively:
 
 1. **Device name** — identifies this machine in notifications (defaults to hostname).
-2. **Endpoint URL** — where to POST the notification. Default: `https://krust.iepose.cn/task-completed`, which is the [QQ Task Notifier](https://github.com/krustd/qqbot) API.
+2. **Endpoint URL** — where to POST the notification. Default: `https://krust.iepose.cn/task-completed`, which is the [QQ Task Notifier](https://github.com/krustd/qq-task-notifier) API.
 3. **Token** — Bearer token for the endpoint.
 
 All values are stored in `~/.config/qn/config` and can also be set via environment variables:
@@ -104,13 +104,13 @@ Content-Type: application/json
 {"summary": "device-name\n..."}
 ```
 
-The companion [QQ Task Notifier](https://github.com/krustd/qqbot) provides this endpoint and forwards messages to QQ private chat. Deploy it alongside `qn` for push notifications on your phone.
+The companion [QQ Task Notifier](https://github.com/krustd/qq-task-notifier) provides this endpoint and forwards messages to QQ private chat. Deploy it alongside `qn` for push notifications on your phone.
 
 Quick server setup:
 
 ```bash
-git clone https://github.com/krustd/qqbot.git
-cd qqbot
+git clone https://github.com/krustd/qq-task-notifier.git
+cd qq-task-notifier
 # Edit docker-compose.yml with your QQ Bot credentials
 docker compose up -d
 ```
