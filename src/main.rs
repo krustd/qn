@@ -8,7 +8,6 @@ use std::time::Instant;
 use reqwest::blocking::Client;
 use serde::Serialize;
 
-const DEFAULT_ENDPOINT: &str = "https://krust.iepose.cn/task-completed";
 
 #[derive(Debug)]
 struct Options {
@@ -49,9 +48,29 @@ fn initialize_config() -> Result<(), String> {
         .map_err(|_| "首次配置需要交互式终端，请手动设置 QN_TOKEN 后重试".to_owned())?;
     let mut input = io::BufReader::new(tty.try_clone().map_err(|error| error.to_string())?);
     let mut output = tty;
+    let endpoint = match env::var("QN_ENDPOINT") {
+        Ok(e) => e,
+        Err(_) => {
+            writeln!(
+                output,
+                "首次使用 qn，需要配置通知端点。请输入 QN_ENDPOINT："
+            )
+            .map_err(|error| error.to_string())?;
+            output.flush().map_err(|error| error.to_string())?;
+            let mut ep = String::new();
+            input
+                .read_line(&mut ep)
+                .map_err(|error| error.to_string())?;
+            let ep = ep.trim().to_owned();
+            if ep.is_empty() {
+                return Err("QN_ENDPOINT 不能为空".into());
+            }
+            ep
+        }
+    };
     writeln!(
         output,
-        "首次使用 qn，需要配置 QQ Bot 通知。请输入 QN_TOKEN："
+        "请输入 QN_TOKEN："
     )
     .map_err(|error| error.to_string())?;
     output.flush().map_err(|error| error.to_string())?;
@@ -63,7 +82,6 @@ fn initialize_config() -> Result<(), String> {
     if token.is_empty() {
         return Err("QN_TOKEN 不能为空".into());
     }
-    let endpoint = env::var("QN_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned());
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -86,7 +104,7 @@ fn print_usage() {
     eprintln!("  qn init");
     eprintln!();
     eprintln!("环境变量:");
-    eprintln!("  QN_ENDPOINT  通知接口，默认 {DEFAULT_ENDPOINT}");
+    eprintln!("  QN_ENDPOINT  通知接口 URL（无默认值，须在 `qn init` 时配置）");
     eprintln!("  QN_TOKEN     通知接口 Bearer Token");
 }
 
@@ -179,7 +197,7 @@ fn notify(summary: &str) -> Result<(), String> {
     let endpoint = env::var("QN_ENDPOINT")
         .ok()
         .or_else(|| read_config_value("endpoint"))
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned());
+        .ok_or("未配置 QN_ENDPOINT，请运行 `qn init` 或设置环境变量".to_owned())?;
     Client::new()
         .post(endpoint)
         .bearer_auth(token)
