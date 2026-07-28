@@ -8,7 +8,7 @@ use std::time::Instant;
 use reqwest::blocking::Client;
 use serde::Serialize;
 
-
+const DEFAULT_ENDPOINT: &str = "https://krust.iepose.cn/task-completed";
 #[derive(Debug)]
 struct Options {
     command: Vec<String>,
@@ -37,15 +37,11 @@ fn read_config_value(name: &str) -> Option<String> {
 
 fn initialize_config() -> Result<(), String> {
     let path = config_path()?;
-    if path.exists() {
-        println!("配置已存在：{}", path.display());
-        return Ok(());
-    }
     let tty = fs::File::options()
         .read(true)
         .write(true)
         .open("/dev/tty")
-        .map_err(|_| "首次配置需要交互式终端，请手动设置 QN_TOKEN 后重试".to_owned())?;
+        .map_err(|_| "配置需要交互式终端，请设置 QN_ENDPOINT 和 QN_TOKEN 环境变量后重试".to_owned())?;
     let mut input = io::BufReader::new(tty.try_clone().map_err(|error| error.to_string())?);
     let mut output = tty;
     let endpoint = match env::var("QN_ENDPOINT") {
@@ -53,7 +49,7 @@ fn initialize_config() -> Result<(), String> {
         Err(_) => {
             writeln!(
                 output,
-                "首次使用 qn，需要配置通知端点。请输入 QN_ENDPOINT："
+                "请输入 QN_ENDPOINT（默认 {DEFAULT_ENDPOINT}）："
             )
             .map_err(|error| error.to_string())?;
             output.flush().map_err(|error| error.to_string())?;
@@ -61,11 +57,12 @@ fn initialize_config() -> Result<(), String> {
             input
                 .read_line(&mut ep)
                 .map_err(|error| error.to_string())?;
-            let ep = ep.trim().to_owned();
+            let ep = ep.trim();
             if ep.is_empty() {
-                return Err("QN_ENDPOINT 不能为空".into());
+                DEFAULT_ENDPOINT.to_owned()
+            } else {
+                ep.to_owned()
             }
-            ep
         }
     };
     writeln!(
@@ -104,7 +101,7 @@ fn print_usage() {
     eprintln!("  qn init");
     eprintln!();
     eprintln!("环境变量:");
-    eprintln!("  QN_ENDPOINT  通知接口 URL（无默认值，须在 `qn init` 时配置）");
+    eprintln!("  QN_ENDPOINT  通知接口 URL（`qn init` 时留空则默认 {DEFAULT_ENDPOINT}）");
     eprintln!("  QN_TOKEN     通知接口 Bearer Token");
 }
 
