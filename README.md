@@ -83,7 +83,7 @@ qn init-shell bash
 qn init-shell zsh
 ```
 
-`init-shell` 不会自动识别 Shell。它会把由 `qn` 管理的函数块写入对应启动文件；重复执行会原位更新，不会重复追加。执行后重启对应 Shell 生效：
+`init-shell` does not auto-detect the shell. It writes a qn-managed function block to the selected startup file; rerunning it updates that block in place instead of appending a duplicate. Restart the selected shell after installation:
 
 | Shell | Startup file |
 |-------|--------------|
@@ -91,7 +91,7 @@ qn init-shell zsh
 | Bash | `~/.bashrc` |
 | Zsh | `~/.zshrc` |
 
-从旧版本升级后，针对当前 Shell 再执行一次 `qn init-shell <shell>`，即可将旧的加载配置迁移为函数块。
+After upgrading from an older release, run `qn init-shell <shell>` once for the current shell to migrate its legacy loader into the function block.
 
 ## Notification request
 
