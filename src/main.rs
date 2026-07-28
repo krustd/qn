@@ -14,6 +14,13 @@ struct Options {
     command: Vec<String>,
     shell: Option<String>,
     notify: bool,
+    attach_output: bool,
+}
+
+#[derive(Debug)]
+struct CommandResult {
+    code: i32,
+    output: Option<std::process::Output>,
 }
 
 #[derive(Serialize)]
@@ -96,9 +103,13 @@ fn initialize_config() -> Result<(), String> {
 
 fn print_usage() {
     eprintln!("用法:");
-    eprintln!("  qn [--no-notify] <command> [args...]");
-    eprintln!("  qn [--no-notify] --shell <command-string>");
+    eprintln!("  qn [-a|--attach-output] [--no-notify] <command> [args...]");
+    eprintln!("  qn [-a|--attach-output] [--no-notify] --shell <command-string>");
     eprintln!("  qn init");
+    eprintln!();
+    eprintln!("选项:");
+    eprintln!("  -a, --attach-output  在通知中附带命令的标准输出和标准错误");
+    eprintln!("  --no-notify          不发送完成通知");
     eprintln!();
     eprintln!("环境变量:");
     eprintln!("  QN_ENDPOINT  通知接口 URL（`qn init` 时留空则默认 {DEFAULT_ENDPOINT}）");
@@ -106,8 +117,13 @@ fn print_usage() {
 }
 
 fn parse_options() -> Result<Options, String> {
-    let mut args = env::args().skip(1).peekable();
+    parse_options_from(env::args().skip(1))
+}
+
+fn parse_options_from(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
+    let mut args = args.into_iter().peekable();
     let mut notify = true;
+    let mut attach_output = false;
     let mut shell = None;
     let mut command = Vec::new();
 
@@ -118,6 +134,9 @@ fn parse_options() -> Result<Options, String> {
                 std::process::exit(0);
             }
             "--no-notify" if command.is_empty() && shell.is_none() => notify = false,
+            "-a" | "--attach-output" if command.is_empty() && shell.is_none() => {
+                attach_output = true
+            }
             "--shell" if command.is_empty() && shell.is_none() => {
                 shell = Some(args.next().ok_or("--shell 后需要命令字符串")?);
             }
@@ -136,10 +155,11 @@ fn parse_options() -> Result<Options, String> {
         command,
         shell,
         notify,
+        attach_output,
     })
 }
 
-fn run(options: &Options) -> Result<i32, String> {
+fn run(options: &Options) -> Result<CommandResult, String> {
     let mut process = if let Some(script) = &options.shell {
         if cfg!(target_os = "windows") {
             let mut command = Command::new("cmd");
@@ -156,10 +176,29 @@ fn run(options: &Options) -> Result<i32, String> {
         command
     };
 
-    let status = process
-        .status()
-        .map_err(|error| format!("启动命令失败: {error}"))?;
-    Ok(status.code().unwrap_or(1))
+    if options.attach_output {
+        let output = process
+            .output()
+            .map_err(|error| format!("启动命令失败: {error}"))?;
+        io::stdout()
+            .write_all(&output.stdout)
+            .map_err(|error| format!("写入命令标准输出失败: {error}"))?;
+        io::stderr()
+            .write_all(&output.stderr)
+            .map_err(|error| format!("写入命令标准错误失败: {error}"))?;
+        Ok(CommandResult {
+            code: output.status.code().unwrap_or(1),
+            output: Some(output),
+        })
+    } else {
+        let status = process
+            .status()
+            .map_err(|error| format!("启动命令失败: {error}"))?;
+        Ok(CommandResult {
+            code: status.code().unwrap_or(1),
+            output: None,
+        })
+    }
 }
 
 fn command_display(options: &Options) -> String {
@@ -184,6 +223,41 @@ fn shell_quote(value: &str) -> String {
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
+}
+
+fn command_output_display(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => "（无输出）".to_owned(),
+        (false, true) => format!("标准输出：\n{stdout}"),
+        (true, false) => format!("标准错误：\n{stderr}"),
+        (false, false) => format!("标准输出：\n{stdout}\n标准错误：\n{stderr}"),
+    }
+}
+
+fn build_summary(
+    options: &Options,
+    code: i32,
+    elapsed_seconds: u64,
+    output: Option<&std::process::Output>,
+) -> String {
+    let state = if code == 0 {
+        "任务完成"
+    } else {
+        "任务失败"
+    };
+    let mut summary = format!(
+        "{state}\n命令：{}\n退出码：{code}\n耗时：{}\n工作目录：{}",
+        command_display(options),
+        format_duration(elapsed_seconds),
+        env::current_dir().map_or_else(|_| "未知".into(), |path| path.display().to_string())
+    );
+    if let Some(output) = output {
+        summary.push_str("\n输出：\n");
+        summary.push_str(&command_output_display(output));
+    }
+    summary
 }
 
 fn notify(summary: &str) -> Result<(), String> {
@@ -227,23 +301,21 @@ fn main() -> ExitCode {
     };
     let started = Instant::now();
     let result = run(&options);
-    let code = match result {
-        Ok(code) => code,
+    let code = match &result {
+        Ok(result) => result.code,
         Err(error) => {
             eprintln!("{error}");
             127
         }
     };
-    let state = if code == 0 {
-        "任务完成"
-    } else {
-        "任务失败"
-    };
-    let summary = format!(
-        "{state}\n命令：{}\n退出码：{code}\n耗时：{}\n工作目录：{}",
-        command_display(&options),
-        format_duration(started.elapsed().as_secs()),
-        env::current_dir().map_or_else(|_| "未知".into(), |path| path.display().to_string())
+    let summary = build_summary(
+        &options,
+        code,
+        started.elapsed().as_secs(),
+        result
+            .as_ref()
+            .ok()
+            .and_then(|result| result.output.as_ref()),
     );
     if options.notify {
         if let Err(error) = notify(&summary) {
@@ -263,5 +335,41 @@ fn format_duration(seconds: u64) -> String {
         format!("{minutes}m {seconds}s")
     } else {
         format!("{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_attach_output_before_command() {
+        let options = parse_options_from(["-a", "--no-notify", "echo", "hello"].map(String::from))
+            .expect("options should parse");
+
+        assert!(options.attach_output);
+        assert!(!options.notify);
+        assert_eq!(options.command, ["echo", "hello"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn attaches_standard_output_and_error_to_summary() {
+        let options = Options {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf output; printf error >&2".into(),
+            ],
+            shell: None,
+            notify: false,
+            attach_output: true,
+        };
+        let result = run(&options).expect("command should run");
+
+        assert_eq!(result.code, 0);
+        let summary = build_summary(&options, result.code, 0, result.output.as_ref());
+        assert!(summary.contains("标准输出：\noutput"));
+        assert!(summary.contains("标准错误：\nerror"));
     }
 }
