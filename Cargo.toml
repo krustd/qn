@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/krustd/qn"
 keywords = ["cli", "notifications", "shell"]
 categories = ["command-line-utilities"]
-include = ["src/**", "Cargo.toml", "Cargo.lock", "LICENSE-*"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "LICENSE-*", "README.md"]
 
 [[bin]]
 name = "qn"
