@@ -9,8 +9,11 @@ use reqwest::blocking::Client;
 use serde::Serialize;
 
 const DEFAULT_ENDPOINT: &str = "https://krust.iepose.cn/task-completed";
+const SHELL_INTEGRATION_ENV: &str = "QN_SHELL_INTEGRATION";
 
 const FISH_SHELL_INIT: &str = r#"function qn
+    set -lx QN_SHELL_INTEGRATION 1
+
     if test (count $argv) -gt 0
         switch $argv[1]
             case -h --help init shell-init __notify __is-configured
@@ -115,6 +118,9 @@ end
 "#;
 
 const BASH_SHELL_INIT: &str = r#"qn() {
+    local QN_SHELL_INTEGRATION=1
+    export QN_SHELL_INTEGRATION
+
     case "${1-}" in
         -h|--help|init|shell-init|__notify|__is-configured)
             command qn "$@"
@@ -190,6 +196,9 @@ const BASH_SHELL_INIT: &str = r#"qn() {
 
 const ZSH_SHELL_INIT: &str = r#"qn() {
     emulate -L zsh
+    local QN_SHELL_INTEGRATION=1
+    export QN_SHELL_INTEGRATION
+
     case "${1-}" in
         -h|--help|init|shell-init|__notify|__is-configured)
             command qn "$@"
@@ -321,6 +330,31 @@ fn configured_value(environment_name: &str, config_name: &str) -> Option<String>
 fn is_configured() -> bool {
     configured_value("QN_TOKEN", "token").is_some()
         && configured_value("QN_ENDPOINT", "endpoint").is_some()
+}
+
+fn shell_integration_is_loaded() -> bool {
+    env::var(SHELL_INTEGRATION_ENV).is_ok_and(|value| value == "1")
+}
+
+fn shell_integration_hint() -> &'static str {
+    let shell_path = env::var_os("SHELL");
+    let shell = shell_path
+        .as_deref()
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str());
+    match shell {
+        Some("fish") => "qn shell-init fish | source",
+        Some("bash") => "eval \"$(qn shell-init bash)\"",
+        Some("zsh") => "eval \"$(qn shell-init zsh)\"",
+        _ => "qn shell-init <fish|bash|zsh>",
+    }
+}
+
+fn warn_missing_shell_integration() {
+    eprintln!(
+        "提示：当前 Shell 未加载 qn 集成；将 `{}` 加入 Shell 启动配置后，qn 才能使用 alias 和 function。",
+        shell_integration_hint()
+    );
 }
 fn write_config_value(path: &Path, name: &str, value: &str) -> Result<(), String> {
     if value.contains(['\n', '\r']) {
@@ -800,6 +834,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if !shell_integration_is_loaded() {
+        warn_missing_shell_integration();
+    }
     if options.notify && !is_configured() {
         eprintln!(
             "提示：qn 尚未初始化；运行 `qn init` 完成通知配置。本次命令会照常执行，但不会发送通知。"
@@ -980,6 +1017,7 @@ mod tests {
             let integration = shell_init(shell).expect("supported shell should have integration");
             assert!(integration.contains("function qn") || integration.contains("qn()"));
             assert!(integration.contains("__notify"));
+            assert!(integration.contains(SHELL_INTEGRATION_ENV));
         }
         assert!(shell_init("sh").is_err());
     }
