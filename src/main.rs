@@ -1,4 +1,7 @@
 use std::env;
+use std::fs;
+use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
@@ -19,10 +22,68 @@ struct Notification<'a> {
     summary: &'a str,
 }
 
+fn config_path() -> Result<PathBuf, String> {
+    let home = env::var_os("HOME").ok_or("无法确定用户目录，请设置 HOME")?;
+    Ok(PathBuf::from(home).join(".config/qn/config"))
+}
+
+fn read_config_value(name: &str) -> Option<String> {
+    let path = config_path().ok()?;
+    let contents = fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == name).then(|| value.trim().to_owned())
+    })
+}
+
+fn initialize_config() -> Result<(), String> {
+    let path = config_path()?;
+    if path.exists() {
+        println!("配置已存在：{}", path.display());
+        return Ok(());
+    }
+    let tty = fs::File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|_| "首次配置需要交互式终端，请手动设置 QN_TOKEN 后重试".to_owned())?;
+    let mut input = io::BufReader::new(tty.try_clone().map_err(|error| error.to_string())?);
+    let mut output = tty;
+    writeln!(
+        output,
+        "首次使用 qn，需要配置 QQ Bot 通知。请输入 QN_TOKEN："
+    )
+    .map_err(|error| error.to_string())?;
+    output.flush().map_err(|error| error.to_string())?;
+    let mut token = String::new();
+    input
+        .read_line(&mut token)
+        .map_err(|error| error.to_string())?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("QN_TOKEN 不能为空".into());
+    }
+    let endpoint = env::var("QN_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned());
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(&path, format!("endpoint={endpoint}\ntoken={token}\n"))
+        .map_err(|error| format!("写入配置失败: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    println!("配置已保存：{}", path.display());
+    Ok(())
+}
+
 fn print_usage() {
     eprintln!("用法:");
     eprintln!("  qn [--no-notify] <command> [args...]");
     eprintln!("  qn [--no-notify] --shell <command-string>");
+    eprintln!("  qn init");
     eprintln!();
     eprintln!("环境变量:");
     eprintln!("  QN_ENDPOINT  通知接口，默认 {DEFAULT_ENDPOINT}");
@@ -111,8 +172,14 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn notify(summary: &str) -> Result<(), String> {
-    let token = env::var("QN_TOKEN").map_err(|_| "未设置 QN_TOKEN，跳过通知".to_owned())?;
-    let endpoint = env::var("QN_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned());
+    let token = env::var("QN_TOKEN")
+        .ok()
+        .or_else(|| read_config_value("token"))
+        .ok_or("未配置 QN_TOKEN，请运行 `qn init` 或设置环境变量".to_owned())?;
+    let endpoint = env::var("QN_ENDPOINT")
+        .ok()
+        .or_else(|| read_config_value("endpoint"))
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned());
     Client::new()
         .post(endpoint)
         .bearer_auth(token)
@@ -125,6 +192,16 @@ fn notify(summary: &str) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    if raw_args.len() == 1 && raw_args[0] == "init" {
+        return match initialize_config() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("错误: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let options = match parse_options() {
         Ok(options) => options,
         Err(error) => {
