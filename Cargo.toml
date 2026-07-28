@@ -1,7 +1,17 @@
 [package]
-name = "qn"
+name = "krust-qn"
 version = "0.1.0"
 edition = "2024"
+description = "Shell-aware command completion notifications"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/krustd/qn"
+keywords = ["cli", "notifications", "shell"]
+categories = ["command-line-utilities"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "LICENSE-*"]
+
+[[bin]]
+name = "qn"
+path = "src/main.rs"
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
