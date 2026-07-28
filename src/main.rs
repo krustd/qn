@@ -9,6 +9,260 @@ use reqwest::blocking::Client;
 use serde::Serialize;
 
 const DEFAULT_ENDPOINT: &str = "https://krust.iepose.cn/task-completed";
+
+const FISH_SHELL_INIT: &str = r#"function qn
+    if test (count $argv) -gt 0
+        switch $argv[1]
+            case -h --help init shell-init __notify __is-configured
+                command qn $argv
+                return $status
+        end
+    end
+
+    set -l qn_original $argv
+    set -l qn_notify 1
+    set -l qn_attach 0
+    set -l qn_has_shell_script 0
+    set -l qn_shell_script
+    set -l qn_args $argv
+    while test (count $qn_args) -gt 0
+        switch $qn_args[1]
+            case --no-notify
+                set qn_notify 0
+                set qn_args $qn_args[2..-1]
+            case -a --attach-output
+                set qn_attach 1
+                set qn_args $qn_args[2..-1]
+            case --shell
+                if test (count $qn_args) -lt 2
+                    command qn $qn_original
+                    return $status
+                end
+                set qn_has_shell_script 1
+                set qn_shell_script $qn_args[2]
+                set qn_args $qn_args[3..-1]
+                break
+            case --
+                set qn_args $qn_args[2..-1]
+                break
+            case '*'
+                break
+        end
+    end
+
+    if test $qn_has_shell_script -eq 0; and test (count $qn_args) -eq 0
+        command qn $qn_original
+        return $status
+    end
+
+    if test $qn_notify -eq 1; and not set -q __qn_config_checked
+        set -g __qn_config_checked 1
+        if not command qn __is-configured
+            printf '%s\n' '提示：qn 尚未初始化；运行 `qn init` 完成通知配置。本次命令会照常执行，但不会发送通知。' >&2
+        end
+    end
+
+    set -l qn_started (date +%s)
+    set -l qn_display
+    if test $qn_has_shell_script -eq 1
+        set qn_display "shell: $qn_shell_script"
+    else
+        set qn_display (string join ' ' (string escape -- $qn_args))
+    end
+
+    set -l qn_tempdir
+    set -l qn_stdout
+    set -l qn_stderr
+    set -l qn_status
+    if test $qn_attach -eq 1
+        set qn_tempdir (mktemp -d)
+        or begin
+            printf '%s\n' '错误：无法创建 qn 输出临时目录。' >&2
+            return 1
+        end
+        set qn_stdout "$qn_tempdir/stdout"
+        set qn_stderr "$qn_tempdir/stderr"
+        if test $qn_has_shell_script -eq 1
+            eval $qn_shell_script >"$qn_stdout" 2>"$qn_stderr"
+        else
+            $qn_args >"$qn_stdout" 2>"$qn_stderr"
+        end
+        set qn_status $status
+        cat "$qn_stdout"
+        cat "$qn_stderr" >&2
+    else
+        if test $qn_has_shell_script -eq 1
+            eval $qn_shell_script
+        else
+            $qn_args
+        end
+        set qn_status $status
+    end
+
+    set -l qn_elapsed (math (date +%s) - $qn_started)
+    if test $qn_notify -eq 1
+        set -l qn_report __notify --command "$qn_display" --exit-code "$qn_status" --elapsed "$qn_elapsed"
+        if test $qn_attach -eq 1
+            set -a qn_report --stdout-file "$qn_stdout" --stderr-file "$qn_stderr"
+        end
+        command qn $qn_report
+    end
+    if test $qn_attach -eq 1
+        command rm -rf -- "$qn_tempdir"
+    end
+    return $qn_status
+end
+"#;
+
+const BASH_SHELL_INIT: &str = r#"qn() {
+    case "${1-}" in
+        -h|--help|init|shell-init|__notify|__is-configured)
+            command qn "$@"
+            return $?
+            ;;
+    esac
+
+    local -a qn_original=("$@") qn_args qn_report
+    local qn_notify=1 qn_attach=0 qn_has_shell_script=0 qn_shell_script
+    while (($#)); do
+        case "$1" in
+            --no-notify) qn_notify=0; shift ;;
+            -a|--attach-output) qn_attach=1; shift ;;
+            --shell)
+                if (($# < 2)); then
+                    command qn "${qn_original[@]}"
+                    return $?
+                fi
+                qn_has_shell_script=1
+                qn_shell_script=$2
+                shift 2
+                break
+                ;;
+            --) shift; break ;;
+            *) break ;;
+        esac
+    done
+    qn_args=("$@")
+    if (( ! qn_has_shell_script && ${#qn_args[@]} == 0 )); then
+        command qn "${qn_original[@]}"
+        return $?
+    fi
+
+    if (( qn_notify )) && [[ -z ${__qn_config_checked+x} ]]; then
+        __qn_config_checked=1
+        if ! command qn __is-configured; then
+            printf '%s\n' '提示：qn 尚未初始化；运行 `qn init` 完成通知配置。本次命令会照常执行，但不会发送通知。' >&2
+        fi
+    fi
+
+    local qn_started=$SECONDS qn_display qn_eval qn_status qn_elapsed qn_tempdir qn_stdout qn_stderr
+    if (( qn_has_shell_script )); then
+        qn_display="shell: $qn_shell_script"
+        qn_eval=$qn_shell_script
+    else
+        printf -v qn_display '%q ' "${qn_args[@]}"
+        qn_display=${qn_display% }
+        qn_eval=$qn_display
+    fi
+    if (( qn_attach )); then
+        qn_tempdir=$(mktemp -d "${TMPDIR:-/tmp}/qn.XXXXXX") || {
+            printf '%s\n' '错误：无法创建 qn 输出临时目录。' >&2
+            return 1
+        }
+        qn_stdout="$qn_tempdir/stdout"
+        qn_stderr="$qn_tempdir/stderr"
+        if eval "$qn_eval" >"$qn_stdout" 2>"$qn_stderr"; then qn_status=0; else qn_status=$?; fi
+        cat "$qn_stdout"
+        cat "$qn_stderr" >&2
+    else
+        if eval "$qn_eval"; then qn_status=0; else qn_status=$?; fi
+    fi
+    qn_elapsed=$((SECONDS - qn_started))
+    if (( qn_notify )); then
+        qn_report=(__notify --command "$qn_display" --exit-code "$qn_status" --elapsed "$qn_elapsed")
+        if (( qn_attach )); then qn_report+=(--stdout-file "$qn_stdout" --stderr-file "$qn_stderr"); fi
+        command qn "${qn_report[@]}" || :
+    fi
+    if (( qn_attach )); then command rm -rf -- "$qn_tempdir"; fi
+    return "$qn_status"
+}
+"#;
+
+const ZSH_SHELL_INIT: &str = r#"qn() {
+    emulate -L zsh
+    case "${1-}" in
+        -h|--help|init|shell-init|__notify|__is-configured)
+            command qn "$@"
+            return $?
+            ;;
+    esac
+
+    local -a qn_original qn_args qn_report
+    qn_original=("$@")
+    local qn_notify=1 qn_attach=0 qn_has_shell_script=0 qn_shell_script
+    while (($#)); do
+        case "$1" in
+            --no-notify) qn_notify=0; shift ;;
+            -a|--attach-output) qn_attach=1; shift ;;
+            --shell)
+                if (($# < 2)); then
+                    command qn "${qn_original[@]}"
+                    return $?
+                fi
+                qn_has_shell_script=1
+                qn_shell_script=$2
+                shift 2
+                break
+                ;;
+            --) shift; break ;;
+            *) break ;;
+        esac
+    done
+    qn_args=("$@")
+    if (( ! qn_has_shell_script && ${#qn_args[@]} == 0 )); then
+        command qn "${qn_original[@]}"
+        return $?
+    fi
+
+    if (( qn_notify )) && [[ -z ${__qn_config_checked+x} ]]; then
+        typeset -g __qn_config_checked=1
+        if ! command qn __is-configured; then
+            printf '%s\n' '提示：qn 尚未初始化；运行 `qn init` 完成通知配置。本次命令会照常执行，但不会发送通知。' >&2
+        fi
+    fi
+
+    local qn_started=$SECONDS qn_display qn_eval qn_status qn_elapsed qn_tempdir qn_stdout qn_stderr
+    if (( qn_has_shell_script )); then
+        qn_display="shell: $qn_shell_script"
+        qn_eval=$qn_shell_script
+    else
+        qn_eval="${(j: :)${(@q)qn_args}}"
+        qn_display=$qn_eval
+    fi
+    if (( qn_attach )); then
+        qn_tempdir=$(mktemp -d "${TMPDIR:-/tmp}/qn.XXXXXX") || {
+            printf '%s\n' '错误：无法创建 qn 输出临时目录。' >&2
+            return 1
+        }
+        qn_stdout="$qn_tempdir/stdout"
+        qn_stderr="$qn_tempdir/stderr"
+        if eval "$qn_eval" >"$qn_stdout" 2>"$qn_stderr"; then qn_status=0; else qn_status=$?; fi
+        cat "$qn_stdout"
+        cat "$qn_stderr" >&2
+    else
+        if eval "$qn_eval"; then qn_status=0; else qn_status=$?; fi
+    fi
+    qn_elapsed=$(( SECONDS - qn_started ))
+    qn_elapsed=${qn_elapsed%.*}
+    if (( qn_notify )); then
+        qn_report=(__notify --command "$qn_display" --exit-code "$qn_status" --elapsed "$qn_elapsed")
+        if (( qn_attach )); then qn_report+=(--stdout-file "$qn_stdout" --stderr-file "$qn_stderr"); fi
+        command qn "${qn_report[@]}" || :
+    fi
+    if (( qn_attach )); then command rm -rf -- "$qn_tempdir"; fi
+    return "$qn_status"
+}
+"#;
 #[derive(Debug)]
 struct Options {
     command: Vec<String>,
@@ -21,6 +275,15 @@ struct Options {
 struct CommandResult {
     code: i32,
     output: Option<std::process::Output>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ShellReport {
+    command: String,
+    code: i32,
+    elapsed_seconds: u64,
+    stdout_file: Option<PathBuf>,
+    stderr_file: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -48,6 +311,17 @@ fn read_config_value(name: &str) -> Option<String> {
     read_config_value_from(&config_path().ok()?, name)
 }
 
+fn configured_value(environment_name: &str, config_name: &str) -> Option<String> {
+    env::var(environment_name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| read_config_value(config_name).filter(|value| !value.is_empty()))
+}
+
+fn is_configured() -> bool {
+    configured_value("QN_TOKEN", "token").is_some()
+        && configured_value("QN_ENDPOINT", "endpoint").is_some()
+}
 fn write_config_value(path: &Path, name: &str, value: &str) -> Result<(), String> {
     if value.contains(['\n', '\r']) {
         return Err("配置值不能包含换行符".into());
@@ -174,6 +448,10 @@ fn initialize_config() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
     println!("配置已保存：{}", path.display());
+    println!("要让 qn 使用当前 Shell 的 alias 和 function，请将对应一行加入启动配置：");
+    println!("  fish: qn shell-init fish | source");
+    println!("  bash: eval \"$(qn shell-init bash)\"");
+    println!("  zsh:  eval \"$(qn shell-init zsh)\"");
     Ok(())
 }
 
@@ -182,6 +460,7 @@ fn print_usage() {
     eprintln!("  qn [-a|--attach-output] [--no-notify] <command> [args...]");
     eprintln!("  qn [-a|--attach-output] [--no-notify] --shell <command-string>");
     eprintln!("  qn init");
+    eprintln!("  qn shell-init <fish|bash|zsh>");
     eprintln!();
     eprintln!("选项:");
     eprintln!("  -a, --attach-output  在通知中附带命令的标准输出和标准错误");
@@ -233,6 +512,94 @@ fn parse_options_from(args: impl IntoIterator<Item = String>) -> Result<Options,
         notify,
         attach_output,
     })
+}
+
+fn shell_init(shell: &str) -> Result<&'static str, String> {
+    match shell {
+        "fish" => Ok(FISH_SHELL_INIT),
+        "bash" => Ok(BASH_SHELL_INIT),
+        "zsh" => Ok(ZSH_SHELL_INIT),
+        _ => Err(format!("不支持的 Shell：{shell}；请使用 fish、bash 或 zsh")),
+    }
+}
+
+fn parse_shell_report(args: impl IntoIterator<Item = String>) -> Result<ShellReport, String> {
+    let mut args = args.into_iter();
+    let mut command = None;
+    let mut code = None;
+    let mut elapsed_seconds = None;
+    let mut stdout_file = None;
+    let mut stderr_file = None;
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--command" if command.is_none() => {
+                command = Some(args.next().ok_or("--command 后需要一个值")?);
+            }
+            "--exit-code" if code.is_none() => {
+                let value = args.next().ok_or("--exit-code 后需要一个值")?;
+                code = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("无效的退出码：{value}"))?,
+                );
+            }
+            "--elapsed" if elapsed_seconds.is_none() => {
+                let value = args.next().ok_or("--elapsed 后需要一个值")?;
+                elapsed_seconds = Some(value.parse().map_err(|_| format!("无效的耗时：{value}"))?);
+            }
+            "--stdout-file" if stdout_file.is_none() => {
+                stdout_file = Some(PathBuf::from(
+                    args.next().ok_or("--stdout-file 后需要一个值")?,
+                ));
+            }
+            "--stderr-file" if stderr_file.is_none() => {
+                stderr_file = Some(PathBuf::from(
+                    args.next().ok_or("--stderr-file 后需要一个值")?,
+                ));
+            }
+            _ => return Err(format!("未知或重复的通知参数：{argument}")),
+        }
+    }
+
+    let (stdout_file, stderr_file) = match (stdout_file, stderr_file) {
+        (Some(stdout_file), Some(stderr_file)) => (Some(stdout_file), Some(stderr_file)),
+        (None, None) => (None, None),
+        _ => return Err("标准输出和标准错误文件必须同时提供".into()),
+    };
+    Ok(ShellReport {
+        command: command.ok_or("--command 不能为空")?,
+        code: code.ok_or("--exit-code 不能为空")?,
+        elapsed_seconds: elapsed_seconds.ok_or("--elapsed 不能为空")?,
+        stdout_file,
+        stderr_file,
+    })
+}
+
+fn notify_shell_report(args: impl IntoIterator<Item = String>) -> Result<(), String> {
+    let report = parse_shell_report(args)?;
+    if !is_configured() {
+        return Ok(());
+    }
+    let output = match (report.stdout_file, report.stderr_file) {
+        (Some(stdout_file), Some(stderr_file)) => {
+            let stdout = fs::read(&stdout_file).map_err(|error| {
+                format!("读取标准输出失败（{}）: {error}", stdout_file.display())
+            })?;
+            let stderr = fs::read(&stderr_file).map_err(|error| {
+                format!("读取标准错误失败（{}）: {error}", stderr_file.display())
+            })?;
+            Some(command_output_display_bytes(&stdout, &stderr))
+        }
+        (None, None) => None,
+        _ => unreachable!("parse_shell_report ensures output files are paired"),
+    };
+    notify(&build_summary_for_command(
+        &report.command,
+        report.code,
+        report.elapsed_seconds,
+        output.as_deref(),
+    ))
 }
 
 fn run(options: &Options) -> Result<CommandResult, String> {
@@ -302,8 +669,12 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn command_output_display(output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    command_output_display_bytes(&output.stdout, &output.stderr)
+}
+
+fn command_output_display_bytes(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
     match (stdout.is_empty(), stderr.is_empty()) {
         (true, true) => "（无输出）".to_owned(),
         (false, true) => format!("标准输出：\n{stdout}"),
@@ -318,20 +689,34 @@ fn build_summary(
     elapsed_seconds: u64,
     output: Option<&std::process::Output>,
 ) -> String {
+    let output = output.map(command_output_display);
+    build_summary_for_command(
+        &command_display(options),
+        code,
+        elapsed_seconds,
+        output.as_deref(),
+    )
+}
+
+fn build_summary_for_command(
+    command: &str,
+    code: i32,
+    elapsed_seconds: u64,
+    output: Option<&str>,
+) -> String {
     let state = if code == 0 {
         "任务完成"
     } else {
         "任务失败"
     };
     let mut summary = format!(
-        "{state}\n命令：{}\n退出码：{code}\n耗时：{}\n工作目录：{}",
-        command_display(options),
+        "{state}\n命令：{command}\n退出码：{code}\n耗时：{}\n工作目录：{}",
         format_duration(elapsed_seconds),
         env::current_dir().map_or_else(|_| "未知".into(), |path| path.display().to_string())
     );
     if let Some(output) = output {
         summary.push_str("\n输出：\n");
-        summary.push_str(&command_output_display(output));
+        summary.push_str(output);
     }
     summary
 }
@@ -341,13 +726,9 @@ fn notification_summary(device_name: &str, summary: &str) -> String {
 }
 
 fn notify(summary: &str) -> Result<(), String> {
-    let token = env::var("QN_TOKEN")
-        .ok()
-        .or_else(|| read_config_value("token"))
+    let token = configured_value("QN_TOKEN", "token")
         .ok_or("未配置 QN_TOKEN，请运行 `qn init` 或设置环境变量".to_owned())?;
-    let endpoint = env::var("QN_ENDPOINT")
-        .ok()
-        .or_else(|| read_config_value("endpoint"))
+    let endpoint = configured_value("QN_ENDPOINT", "endpoint")
         .ok_or("未配置 QN_ENDPOINT，请运行 `qn init` 或设置环境变量".to_owned())?;
     let summary = notification_summary(&device_name()?, summary);
     Client::new()
@@ -372,6 +753,45 @@ fn main() -> ExitCode {
             }
         };
     }
+    if raw_args
+        .first()
+        .is_some_and(|argument| argument == "shell-init")
+    {
+        if raw_args.len() != 2 {
+            eprintln!("错误: `qn shell-init` 后需要指定 fish、bash 或 zsh");
+            return ExitCode::from(2);
+        }
+        return match shell_init(&raw_args[1]) {
+            Ok(script) => {
+                print!("{script}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("错误: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if raw_args.len() == 1 && raw_args[0] == "__is-configured" {
+        return if is_configured() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
+    }
+    if raw_args
+        .first()
+        .is_some_and(|argument| argument == "__notify")
+    {
+        return match notify_shell_report(raw_args.into_iter().skip(1)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("警告: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     let options = match parse_options() {
         Ok(options) => options,
         Err(error) => {
@@ -380,6 +800,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if options.notify && !is_configured() {
+        eprintln!(
+            "提示：qn 尚未初始化；运行 `qn init` 完成通知配置。本次命令会照常执行，但不会发送通知。"
+        );
+    }
     let started = Instant::now();
     let result = run(&options);
     let code = match &result {
@@ -398,7 +823,7 @@ fn main() -> ExitCode {
             .ok()
             .and_then(|result| result.output.as_ref()),
     );
-    if options.notify {
+    if options.notify && is_configured() {
         if let Err(error) = notify(&summary) {
             eprintln!("警告: {error}");
         }
@@ -497,5 +922,65 @@ mod tests {
 
         assert_eq!(name, "办公室 Mac");
         fs::remove_file(path).expect("temporary config should be removed");
+    }
+    #[test]
+    fn parses_shell_report_with_captured_output() {
+        let report = parse_shell_report(
+            [
+                "--command",
+                "deploy preview",
+                "--exit-code",
+                "17",
+                "--elapsed",
+                "42",
+                "--stdout-file",
+                "/tmp/qn-stdout",
+                "--stderr-file",
+                "/tmp/qn-stderr",
+            ]
+            .map(String::from),
+        )
+        .expect("shell report should parse");
+
+        assert_eq!(
+            report,
+            ShellReport {
+                command: "deploy preview".into(),
+                code: 17,
+                elapsed_seconds: 42,
+                stdout_file: Some(PathBuf::from("/tmp/qn-stdout")),
+                stderr_file: Some(PathBuf::from("/tmp/qn-stderr")),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_shell_report_with_only_one_output_file() {
+        let error = parse_shell_report(
+            [
+                "--command",
+                "echo hello",
+                "--exit-code",
+                "0",
+                "--elapsed",
+                "1",
+                "--stdout-file",
+                "/tmp/qn-stdout",
+            ]
+            .map(String::from),
+        )
+        .expect_err("unpaired output files should fail");
+
+        assert!(error.contains("必须同时提供"));
+    }
+
+    #[test]
+    fn provides_shell_integrations_for_supported_shells() {
+        for shell in ["fish", "bash", "zsh"] {
+            let integration = shell_init(shell).expect("supported shell should have integration");
+            assert!(integration.contains("function qn") || integration.contains("qn()"));
+            assert!(integration.contains("__notify"));
+        }
+        assert!(shell_init("sh").is_err());
     }
 }
