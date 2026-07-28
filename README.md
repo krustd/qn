@@ -34,7 +34,6 @@ Without configuration, `qn` still runs the command but prints a reminder and ski
 qn [-a|--attach-output] [--no-notify] <command> [args...]
 qn [-a|--attach-output] [--no-notify] --shell <command-string>
 qn init
-qn shell-init <fish|bash|zsh>
 qn init-shell <fish|bash|zsh>
 ```
 
@@ -84,7 +83,7 @@ qn init-shell bash
 qn init-shell zsh
 ```
 
-`init-shell` does not auto-detect the shell and does not append the function itself. It appends one initialization command—only once—to the selected startup file:
+`init-shell` 不会自动识别 Shell。它会把由 `qn` 管理的函数块写入对应启动文件；重复执行会原位更新，不会重复追加。执行后重启对应 Shell 生效：
 
 | Shell | Startup file |
 |-------|--------------|
@@ -92,28 +91,7 @@ qn init-shell zsh
 | Bash | `~/.bashrc` |
 | Zsh | `~/.zshrc` |
 
-The same initialization command can load the function into the current shell:
-
-```bash
-# Fish
-qn shell-init fish | source
-
-# Bash
-eval "$(qn shell-init bash)"
-
-# Zsh
-eval "$(qn shell-init zsh)"
-```
-
-After it is loaded, `qn` sends a report for every wrapped command, regardless of elapsed time. The function preserves the wrapped command's exit status. `--no-notify` still runs the command but omits the report; `-a` captures and replays output before reporting it.
-
-For plugin managers or another custom startup arrangement, print the function without changing a startup file:
-
-```bash
-qn shell-init fish
-qn shell-init bash
-qn shell-init zsh
-```
+从旧版本升级后，针对当前 Shell 再执行一次 `qn init-shell <shell>`，即可将旧的加载配置迁移为函数块。
 
 ## Notification request
 

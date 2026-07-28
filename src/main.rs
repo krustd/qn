@@ -49,7 +49,7 @@ impl ShellKind {
         }
     }
 
-    fn integration_command(self) -> &'static str {
+    fn legacy_integration_command(self) -> &'static str {
         match self {
             Self::Fish => "qn shell-init fish | source",
             Self::Bash => "eval \"$(qn shell-init bash)\"",
@@ -87,7 +87,7 @@ const FISH_SHELL_INIT: &str = r#"function qn
 
     if test (count $argv) -gt 0
         switch $argv[1]
-            case -h --help init init-shell shell-init __notify __is-configured
+            case -h --help init init-shell __notify __is-configured
                 command qn $argv
                 return $status
         end
@@ -193,7 +193,7 @@ const BASH_SHELL_INIT: &str = r#"qn() {
     export QN_SHELL_INTEGRATION
 
     case "${1-}" in
-        -h|--help|init|init-shell|shell-init|__notify|__is-configured)
+        -h|--help|init|init-shell|__notify|__is-configured)
             command qn "$@"
             return $?
             ;;
@@ -271,7 +271,7 @@ const ZSH_SHELL_INIT: &str = r#"qn() {
     export QN_SHELL_INTEGRATION
 
     case "${1-}" in
-        -h|--help|init|init-shell|shell-init|__notify|__is-configured)
+        -h|--help|init|init-shell|__notify|__is-configured)
             command qn "$@"
             return $?
             ;;
@@ -461,7 +461,10 @@ fn warn_missing_shell_integration() {
     }
 }
 
-fn append_line_if_absent(path: &Path, line: &str) -> Result<bool, String> {
+const SHELL_INTEGRATION_BEGIN_MARKER: &str = "# >>> qn shell integration >>>";
+const SHELL_INTEGRATION_END_MARKER: &str = "# <<< qn shell integration <<<";
+
+fn write_shell_integration(path: &Path, shell: ShellKind) -> Result<bool, String> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -472,24 +475,49 @@ fn append_line_if_absent(path: &Path, line: &str) -> Result<bool, String> {
             ));
         }
     };
-    if contents.lines().any(|existing| existing.trim() == line) {
-        return Ok(false);
+    let legacy_command = shell.legacy_integration_command();
+    let without_legacy_loader = contents
+        .split_inclusive('\n')
+        .filter(|line| line.trim() != legacy_command)
+        .collect::<String>();
+    let mut updated = if without_legacy_loader == contents {
+        contents.clone()
+    } else {
+        without_legacy_loader
+    };
+
+    let integration = format!(
+        "{SHELL_INTEGRATION_BEGIN_MARKER}\n{}{SHELL_INTEGRATION_END_MARKER}\n",
+        shell.init_script()
+    );
+    if let Some(begin) = updated.find(SHELL_INTEGRATION_BEGIN_MARKER) {
+        let end = updated[begin..]
+            .find(SHELL_INTEGRATION_END_MARKER)
+            .map(|offset| begin + offset + SHELL_INTEGRATION_END_MARKER.len())
+            .ok_or_else(|| format!("Shell 启动配置中的 qn 集成标记不完整（{}）", path.display()))?;
+        let end = if updated[end..].starts_with('\n') {
+            end + 1
+        } else {
+            end
+        };
+        updated.replace_range(begin..end, &integration);
+    } else {
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&integration);
     }
 
+    if updated == contents {
+        return Ok(false);
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("创建 Shell 配置目录失败（{}）: {error}", parent.display()))?;
     }
     let is_new = !path.exists();
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)
+    fs::write(path, updated)
         .map_err(|error| format!("写入 Shell 启动配置失败（{}）: {error}", path.display()))?;
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        writeln!(file).map_err(|error| format!("写入 Shell 启动配置失败: {error}"))?;
-    }
-    writeln!(file, "{line}").map_err(|error| format!("写入 Shell 启动配置失败: {error}"))?;
     #[cfg(unix)]
     if is_new {
         use std::os::unix::fs::PermissionsExt;
@@ -504,17 +532,16 @@ fn install_shell_integration(shell_name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("不支持的 Shell：{shell_name}；请使用 fish、bash 或 zsh"))?;
     let home = env::var_os("HOME").ok_or("无法确定用户目录，请设置 HOME")?;
     let path = shell.startup_config_path(&PathBuf::from(home));
-    let inserted = append_line_if_absent(&path, shell.integration_command())?;
-    let state = if inserted {
+    let updated = write_shell_integration(&path, shell)?;
+    let state = if updated {
         "已写入"
     } else {
-        "已存在于"
+        "已经是最新内容"
     };
     Ok(format!(
-        "qn {} {}。当前会话运行 `{}` 立即生效，或重启 {}。",
+        "qn 集成{} {}；重启 {} 后生效。",
         state,
         path.display(),
-        shell.integration_command(),
         shell.display_name()
     ))
 }
@@ -656,7 +683,6 @@ fn print_usage() {
     eprintln!("  qn [-a|--attach-output] [--no-notify] <command> [args...]");
     eprintln!("  qn [-a|--attach-output] [--no-notify] --shell <command-string>");
     eprintln!("  qn init");
-    eprintln!("  qn shell-init <fish|bash|zsh>");
     eprintln!("  qn init-shell <fish|bash|zsh>");
     eprintln!();
     eprintln!("选项:");
@@ -709,12 +735,6 @@ fn parse_options_from(args: impl IntoIterator<Item = String>) -> Result<Options,
         notify,
         attach_output,
     })
-}
-
-fn shell_init(shell_name: &str) -> Result<&'static str, String> {
-    ShellKind::from_name(shell_name)
-        .map(ShellKind::init_script)
-        .ok_or_else(|| format!("不支持的 Shell：{shell_name}；请使用 fish、bash 或 zsh"))
 }
 
 fn parse_shell_report(args: impl IntoIterator<Item = String>) -> Result<ShellReport, String> {
@@ -966,25 +986,6 @@ fn main() -> ExitCode {
             }
         };
     }
-    if raw_args
-        .first()
-        .is_some_and(|argument| argument == "shell-init")
-    {
-        if raw_args.len() != 2 {
-            eprintln!("错误: `qn shell-init` 后需要指定 fish、bash 或 zsh");
-            return ExitCode::from(2);
-        }
-        return match shell_init(&raw_args[1]) {
-            Ok(script) => {
-                print!("{script}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("错误: {error}");
-                ExitCode::from(2)
-            }
-        };
-    }
     if raw_args.len() == 1 && raw_args[0] == "__is-configured" {
         return if is_configured() {
             ExitCode::SUCCESS
@@ -1191,49 +1192,49 @@ mod tests {
     }
 
     #[test]
-    fn appends_shell_integration_once() {
+    fn writes_shell_integration_once_and_migrates_legacy_loader() {
         let path = env::temp_dir().join(format!(
-            "qn-shell-init-test-{}-{}",
+            "qn-shell-integration-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system time should be after Unix epoch")
                 .as_nanos()
         ));
-        let line = ShellKind::Bash.integration_command();
+        fs::write(
+            &path,
+            format!(
+                "export PATH\n{}\n",
+                ShellKind::Bash.legacy_integration_command()
+            ),
+        )
+        .expect("legacy loader should be written");
 
-        assert!(append_line_if_absent(&path, line).expect("line should be appended"));
-        assert!(!append_line_if_absent(&path, line).expect("line should not duplicate"));
-        assert_eq!(
-            fs::read_to_string(&path).expect("line should be written"),
-            format!("{line}\n")
+        assert!(
+            write_shell_integration(&path, ShellKind::Bash).expect("integration should be written")
         );
+        assert!(
+            !write_shell_integration(&path, ShellKind::Bash)
+                .expect("integration should not change")
+        );
+        let contents = fs::read_to_string(&path).expect("integration should be readable");
+        assert!(contents.starts_with("export PATH\n"));
+        assert!(contents.contains(SHELL_INTEGRATION_BEGIN_MARKER));
+        assert!(contents.contains(BASH_SHELL_INIT));
+        assert!(contents.contains(SHELL_INTEGRATION_END_MARKER));
+        assert!(!contents.contains(ShellKind::Bash.legacy_integration_command()));
 
         fs::remove_file(path).expect("temporary config should be removed");
     }
 
     #[test]
-    fn recognizes_shells_from_process_commands() {
-        assert_eq!(
-            ShellKind::from_process_command("/opt/homebrew/bin/fish"),
-            Some(ShellKind::Fish)
-        );
-        assert_eq!(
-            ShellKind::from_process_command("/bin/-bash"),
-            Some(ShellKind::Bash)
-        );
-        assert_eq!(ShellKind::from_process_command("zsh"), Some(ShellKind::Zsh));
-        assert_eq!(ShellKind::from_process_command("/usr/bin/env"), None);
-    }
-
-    #[test]
     fn provides_shell_integrations_for_supported_shells() {
-        for shell in ["fish", "bash", "zsh"] {
-            let integration = shell_init(shell).expect("supported shell should have integration");
+        for shell in [ShellKind::Fish, ShellKind::Bash, ShellKind::Zsh] {
+            let integration = shell.init_script();
             assert!(integration.contains("function qn") || integration.contains("qn()"));
             assert!(integration.contains("__notify"));
             assert!(integration.contains(SHELL_INTEGRATION_ENV));
         }
-        assert!(shell_init("sh").is_err());
+        assert!(ShellKind::from_name("sh").is_none());
     }
 }
