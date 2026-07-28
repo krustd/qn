@@ -32,6 +32,15 @@ impl ShellKind {
         }
     }
 
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "fish" => Some(Self::Fish),
+            "bash" => Some(Self::Bash),
+            "zsh" => Some(Self::Zsh),
+            _ => None,
+        }
+    }
+
     fn display_name(self) -> &'static str {
         match self {
             Self::Fish => "Fish",
@@ -47,6 +56,30 @@ impl ShellKind {
             Self::Zsh => "eval \"$(qn shell-init zsh)\"",
         }
     }
+
+    fn init_script(self) -> &'static str {
+        match self {
+            Self::Fish => FISH_SHELL_INIT,
+            Self::Bash => BASH_SHELL_INIT,
+            Self::Zsh => ZSH_SHELL_INIT,
+        }
+    }
+
+    fn startup_config_path(self, home: &Path) -> PathBuf {
+        match self {
+            Self::Fish => home.join(".config/fish/config.fish"),
+            Self::Bash => home.join(".bashrc"),
+            Self::Zsh => home.join(".zshrc"),
+        }
+    }
+
+    fn install_command(self) -> &'static str {
+        match self {
+            Self::Fish => "qn init-shell fish",
+            Self::Bash => "qn init-shell bash",
+            Self::Zsh => "qn init-shell zsh",
+        }
+    }
 }
 
 const FISH_SHELL_INIT: &str = r#"function qn
@@ -54,7 +87,7 @@ const FISH_SHELL_INIT: &str = r#"function qn
 
     if test (count $argv) -gt 0
         switch $argv[1]
-            case -h --help init shell-init __notify __is-configured
+            case -h --help init init-shell shell-init __notify __is-configured
                 command qn $argv
                 return $status
         end
@@ -160,7 +193,7 @@ const BASH_SHELL_INIT: &str = r#"qn() {
     export QN_SHELL_INTEGRATION
 
     case "${1-}" in
-        -h|--help|init|shell-init|__notify|__is-configured)
+        -h|--help|init|init-shell|shell-init|__notify|__is-configured)
             command qn "$@"
             return $?
             ;;
@@ -238,7 +271,7 @@ const ZSH_SHELL_INIT: &str = r#"qn() {
     export QN_SHELL_INTEGRATION
 
     case "${1-}" in
-        -h|--help|init|shell-init|__notify|__is-configured)
+        -h|--help|init|init-shell|shell-init|__notify|__is-configured)
             command qn "$@"
             return $?
             ;;
@@ -414,18 +447,76 @@ fn shell_from_ancestor_processes() -> Option<ShellKind> {
 fn warn_missing_shell_integration() {
     if let Some(shell) = shell_from_ancestor_processes() {
         eprintln!(
-            "提示：当前 {} 未加载 qn 集成；将 `{}` 加入 Shell 启动配置后，qn 才能使用 alias 和 function。",
+            "提示：当前 {} 未加载 qn 集成；运行 `{}` 会将集成写入启动配置，之后 qn 才能使用 alias 和 function。",
             shell.display_name(),
-            shell.integration_command()
+            shell.install_command()
         );
     } else {
         eprintln!(
-            "提示：当前 Shell 未加载 qn 集成。请按所用 Shell 添加其一：\n  Fish: {}\n  Bash: {}\n  Zsh:  {}",
-            ShellKind::Fish.integration_command(),
-            ShellKind::Bash.integration_command(),
-            ShellKind::Zsh.integration_command()
+            "提示：当前 Shell 未加载 qn 集成。运行其一以写入启动配置：\n  Fish: {}\n  Bash: {}\n  Zsh:  {}",
+            ShellKind::Fish.install_command(),
+            ShellKind::Bash.install_command(),
+            ShellKind::Zsh.install_command()
         );
     }
+}
+
+fn append_line_if_absent(path: &Path, line: &str) -> Result<bool, String> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "读取 Shell 启动配置失败（{}）: {error}",
+                path.display()
+            ));
+        }
+    };
+    if contents.lines().any(|existing| existing.trim() == line) {
+        return Ok(false);
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("创建 Shell 配置目录失败（{}）: {error}", parent.display()))?;
+    }
+    let is_new = !path.exists();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|error| format!("写入 Shell 启动配置失败（{}）: {error}", path.display()))?;
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        writeln!(file).map_err(|error| format!("写入 Shell 启动配置失败: {error}"))?;
+    }
+    writeln!(file, "{line}").map_err(|error| format!("写入 Shell 启动配置失败: {error}"))?;
+    #[cfg(unix)]
+    if is_new {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("设置配置权限失败: {error}"))?;
+    }
+    Ok(true)
+}
+
+fn install_shell_integration(shell_name: &str) -> Result<String, String> {
+    let shell = ShellKind::from_name(shell_name)
+        .ok_or_else(|| format!("不支持的 Shell：{shell_name}；请使用 fish、bash 或 zsh"))?;
+    let home = env::var_os("HOME").ok_or("无法确定用户目录，请设置 HOME")?;
+    let path = shell.startup_config_path(&PathBuf::from(home));
+    let inserted = append_line_if_absent(&path, shell.integration_command())?;
+    let state = if inserted {
+        "已写入"
+    } else {
+        "已存在于"
+    };
+    Ok(format!(
+        "qn {} {}。当前会话运行 `{}` 立即生效，或重启 {}。",
+        state,
+        path.display(),
+        shell.integration_command(),
+        shell.display_name()
+    ))
 }
 fn write_config_value(path: &Path, name: &str, value: &str) -> Result<(), String> {
     if value.contains(['\n', '\r']) {
@@ -553,10 +644,10 @@ fn initialize_config() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
     println!("配置已保存：{}", path.display());
-    println!("要让 qn 使用当前 Shell 的 alias 和 function，请将对应一行加入启动配置：");
-    println!("  fish: qn shell-init fish | source");
-    println!("  bash: eval \"$(qn shell-init bash)\"");
-    println!("  zsh:  eval \"$(qn shell-init zsh)\"");
+    println!("要让 qn 使用当前 Shell 的 alias 和 function，请运行对应命令写入启动配置：");
+    println!("  fish: qn init-shell fish");
+    println!("  bash: qn init-shell bash");
+    println!("  zsh:  qn init-shell zsh");
     Ok(())
 }
 
@@ -566,6 +657,7 @@ fn print_usage() {
     eprintln!("  qn [-a|--attach-output] [--no-notify] --shell <command-string>");
     eprintln!("  qn init");
     eprintln!("  qn shell-init <fish|bash|zsh>");
+    eprintln!("  qn init-shell <fish|bash|zsh>");
     eprintln!();
     eprintln!("选项:");
     eprintln!("  -a, --attach-output  在通知中附带命令的标准输出和标准错误");
@@ -619,13 +711,10 @@ fn parse_options_from(args: impl IntoIterator<Item = String>) -> Result<Options,
     })
 }
 
-fn shell_init(shell: &str) -> Result<&'static str, String> {
-    match shell {
-        "fish" => Ok(FISH_SHELL_INIT),
-        "bash" => Ok(BASH_SHELL_INIT),
-        "zsh" => Ok(ZSH_SHELL_INIT),
-        _ => Err(format!("不支持的 Shell：{shell}；请使用 fish、bash 或 zsh")),
-    }
+fn shell_init(shell_name: &str) -> Result<&'static str, String> {
+    ShellKind::from_name(shell_name)
+        .map(ShellKind::init_script)
+        .ok_or_else(|| format!("不支持的 Shell：{shell_name}；请使用 fish、bash 或 zsh"))
 }
 
 fn parse_shell_report(args: impl IntoIterator<Item = String>) -> Result<ShellReport, String> {
@@ -860,6 +949,25 @@ fn main() -> ExitCode {
     }
     if raw_args
         .first()
+        .is_some_and(|argument| argument == "init-shell")
+    {
+        if raw_args.len() != 2 {
+            eprintln!("错误: `qn init-shell` 后需要指定 fish、bash 或 zsh");
+            return ExitCode::from(2);
+        }
+        return match install_shell_integration(&raw_args[1]) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("错误: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if raw_args
+        .first()
         .is_some_and(|argument| argument == "shell-init")
     {
         if raw_args.len() != 2 {
@@ -1080,6 +1188,28 @@ mod tests {
         .expect_err("unpaired output files should fail");
 
         assert!(error.contains("必须同时提供"));
+    }
+
+    #[test]
+    fn appends_shell_integration_once() {
+        let path = env::temp_dir().join(format!(
+            "qn-shell-init-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after Unix epoch")
+                .as_nanos()
+        ));
+        let line = ShellKind::Bash.integration_command();
+
+        assert!(append_line_if_absent(&path, line).expect("line should be appended"));
+        assert!(!append_line_if_absent(&path, line).expect("line should not duplicate"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("line should be written"),
+            format!("{line}\n")
+        );
+
+        fs::remove_file(path).expect("temporary config should be removed");
     }
 
     #[test]
