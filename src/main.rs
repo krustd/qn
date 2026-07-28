@@ -11,6 +11,44 @@ use serde::Serialize;
 const DEFAULT_ENDPOINT: &str = "https://krust.iepose.cn/task-completed";
 const SHELL_INTEGRATION_ENV: &str = "QN_SHELL_INTEGRATION";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellKind {
+    Fish,
+    Bash,
+    Zsh,
+}
+
+impl ShellKind {
+    fn from_process_command(command: &str) -> Option<Self> {
+        match Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.trim_start_matches('-'))
+        {
+            Some("fish") => Some(Self::Fish),
+            Some("bash") => Some(Self::Bash),
+            Some("zsh") => Some(Self::Zsh),
+            _ => None,
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Fish => "Fish",
+            Self::Bash => "Bash",
+            Self::Zsh => "Zsh",
+        }
+    }
+
+    fn integration_command(self) -> &'static str {
+        match self {
+            Self::Fish => "qn shell-init fish | source",
+            Self::Bash => "eval \"$(qn shell-init bash)\"",
+            Self::Zsh => "eval \"$(qn shell-init zsh)\"",
+        }
+    }
+}
+
 const FISH_SHELL_INIT: &str = r#"function qn
     set -lx QN_SHELL_INTEGRATION 1
 
@@ -336,25 +374,58 @@ fn shell_integration_is_loaded() -> bool {
     env::var(SHELL_INTEGRATION_ENV).is_ok_and(|value| value == "1")
 }
 
-fn shell_integration_hint() -> &'static str {
-    let shell_path = env::var_os("SHELL");
-    let shell = shell_path
-        .as_deref()
-        .and_then(|path| Path::new(path).file_name())
-        .and_then(|name| name.to_str());
-    match shell {
-        Some("fish") => "qn shell-init fish | source",
-        Some("bash") => "eval \"$(qn shell-init bash)\"",
-        Some("zsh") => "eval \"$(qn shell-init zsh)\"",
-        _ => "qn shell-init <fish|bash|zsh>",
+#[cfg(unix)]
+fn process_info(pid: u32) -> Option<(u32, String)> {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "ppid=", "-o", "comm="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut fields = stdout.split_whitespace();
+    let parent_pid = fields.next()?.parse().ok()?;
+    let command = fields.next()?.to_owned();
+    Some((parent_pid, command))
+}
+
+#[cfg(unix)]
+fn shell_from_ancestor_processes() -> Option<ShellKind> {
+    let mut pid = std::process::id();
+    for _ in 0..8 {
+        let (parent_pid, command) = process_info(pid)?;
+        if let Some(shell) = ShellKind::from_process_command(&command) {
+            return Some(shell);
+        }
+        if parent_pid <= 1 || parent_pid == pid {
+            break;
+        }
+        pid = parent_pid;
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn shell_from_ancestor_processes() -> Option<ShellKind> {
+    None
 }
 
 fn warn_missing_shell_integration() {
-    eprintln!(
-        "提示：当前 Shell 未加载 qn 集成；将 `{}` 加入 Shell 启动配置后，qn 才能使用 alias 和 function。",
-        shell_integration_hint()
-    );
+    if let Some(shell) = shell_from_ancestor_processes() {
+        eprintln!(
+            "提示：当前 {} 未加载 qn 集成；将 `{}` 加入 Shell 启动配置后，qn 才能使用 alias 和 function。",
+            shell.display_name(),
+            shell.integration_command()
+        );
+    } else {
+        eprintln!(
+            "提示：当前 Shell 未加载 qn 集成。请按所用 Shell 添加其一：\n  Fish: {}\n  Bash: {}\n  Zsh:  {}",
+            ShellKind::Fish.integration_command(),
+            ShellKind::Bash.integration_command(),
+            ShellKind::Zsh.integration_command()
+        );
+    }
 }
 fn write_config_value(path: &Path, name: &str, value: &str) -> Result<(), String> {
     if value.contains(['\n', '\r']) {
@@ -1009,6 +1080,20 @@ mod tests {
         .expect_err("unpaired output files should fail");
 
         assert!(error.contains("必须同时提供"));
+    }
+
+    #[test]
+    fn recognizes_shells_from_process_commands() {
+        assert_eq!(
+            ShellKind::from_process_command("/opt/homebrew/bin/fish"),
+            Some(ShellKind::Fish)
+        );
+        assert_eq!(
+            ShellKind::from_process_command("/bin/-bash"),
+            Some(ShellKind::Bash)
+        );
+        assert_eq!(ShellKind::from_process_command("zsh"), Some(ShellKind::Zsh));
+        assert_eq!(ShellKind::from_process_command("/usr/bin/env"), None);
     }
 
     #[test]
