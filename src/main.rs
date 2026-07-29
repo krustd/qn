@@ -141,7 +141,7 @@ const FISH_SHELL_INIT: &str = r#"function qn
     if test $qn_has_shell_script -eq 1
         set qn_display "shell: $qn_shell_script"
     else
-        set qn_display (string join ' ' (string escape -- $qn_args))
+        set qn_display (string join -- ' ' (string escape -- $qn_args))
     end
 
     set -l qn_tempdir
