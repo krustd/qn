@@ -87,7 +87,7 @@ const FISH_SHELL_INIT: &str = r#"function qn
 
     if test (count $argv) -gt 0
         switch $argv[1]
-            case -h --help init init-shell __notify __is-configured
+            case -h --help -m --message init init-shell __notify __is-configured
                 command qn $argv
                 return $status
         end
@@ -115,10 +115,20 @@ const FISH_SHELL_INIT: &str = r#"function qn
                 set qn_has_shell_script 1
                 set qn_shell_script $qn_args[2]
                 set qn_args $qn_args[3..-1]
+                if test (count $qn_args) -gt 0
+                    command qn $qn_original
+                    return $status
+                end
                 break
+            case -m --message
+                command qn $qn_original
+                return $status
             case --
                 set qn_args $qn_args[2..-1]
                 break
+            case '-*'
+                command qn $qn_original
+                return $status
             case '*'
                 break
         end
@@ -193,7 +203,7 @@ const BASH_SHELL_INIT: &str = r#"qn() {
     export QN_SHELL_INTEGRATION
 
     case "${1-}" in
-        -h|--help|init|init-shell|__notify|__is-configured)
+        -h|--help|-m|--message|init|init-shell|__notify|__is-configured)
             command qn "$@"
             return $?
             ;;
@@ -213,9 +223,18 @@ const BASH_SHELL_INIT: &str = r#"qn() {
                 qn_has_shell_script=1
                 qn_shell_script=$2
                 shift 2
+                if (($#)); then
+                    command qn "${qn_original[@]}"
+                    return $?
+                fi
                 break
                 ;;
+            -m|--message)
+                command qn "${qn_original[@]}"
+                return $?
+                ;;
             --) shift; break ;;
+            -?*) command qn "${qn_original[@]}"; return $? ;;
             *) break ;;
         esac
     done
@@ -271,7 +290,7 @@ const ZSH_SHELL_INIT: &str = r#"qn() {
     export QN_SHELL_INTEGRATION
 
     case "${1-}" in
-        -h|--help|init|init-shell|__notify|__is-configured)
+        -h|--help|-m|--message|init|init-shell|__notify|__is-configured)
             command qn "$@"
             return $?
             ;;
@@ -292,9 +311,18 @@ const ZSH_SHELL_INIT: &str = r#"qn() {
                 qn_has_shell_script=1
                 qn_shell_script=$2
                 shift 2
+                if (($#)); then
+                    command qn "${qn_original[@]}"
+                    return $?
+                fi
                 break
                 ;;
+            -m|--message)
+                command qn "${qn_original[@]}"
+                return $?
+                ;;
             --) shift; break ;;
+            -?*) command qn "${qn_original[@]}"; return $? ;;
             *) break ;;
         esac
     done
@@ -343,6 +371,12 @@ const ZSH_SHELL_INIT: &str = r#"qn() {
     return "$qn_status"
 }
 "#;
+#[derive(Debug)]
+enum Invocation {
+    Run(Options),
+    Message(String),
+}
+
 #[derive(Debug)]
 struct Options {
     command: Vec<String>,
@@ -682,59 +716,96 @@ fn print_usage() {
     eprintln!("用法:");
     eprintln!("  qn [-a|--attach-output] [--no-notify] <command> [args...]");
     eprintln!("  qn [-a|--attach-output] [--no-notify] --shell <command-string>");
+    eprintln!("  qn -m|--message <message>");
     eprintln!("  qn init");
     eprintln!("  qn init-shell <fish|bash|zsh>");
     eprintln!();
     eprintln!("选项:");
     eprintln!("  -a, --attach-output  在通知中附带命令的标准输出和标准错误");
     eprintln!("  --no-notify          不发送完成通知");
+    eprintln!("  -m, --message        直接发送消息，不执行命令");
+    eprintln!("  --                   结束 qn 选项；其后的第一个参数是要执行的命令");
     eprintln!();
     eprintln!("环境变量:");
     eprintln!("  QN_ENDPOINT  通知接口 URL（`qn init` 时留空则默认 {DEFAULT_ENDPOINT}）");
     eprintln!("  QN_TOKEN     通知接口 Bearer Token");
 }
 
-fn parse_options() -> Result<Options, String> {
+fn parse_options() -> Result<Invocation, String> {
     parse_options_from(env::args().skip(1))
 }
 
-fn parse_options_from(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
-    let mut args = args.into_iter().peekable();
+fn parse_options_from(args: impl IntoIterator<Item = String>) -> Result<Invocation, String> {
+    let mut args = args.into_iter();
     let mut notify = true;
     let mut attach_output = false;
     let mut shell = None;
-    let mut command = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-h" | "--help" if command.is_empty() && shell.is_none() => {
+            "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
             }
-            "--no-notify" if command.is_empty() && shell.is_none() => notify = false,
-            "-a" | "--attach-output" if command.is_empty() && shell.is_none() => {
-                attach_output = true
-            }
-            "--shell" if command.is_empty() && shell.is_none() => {
-                shell = Some(args.next().ok_or("--shell 后需要命令字符串")?);
-            }
-            "--" if command.is_empty() && shell.is_none() => {
-                command.extend(args);
+            "--no-notify" => notify = false,
+            "-a" | "--attach-output" => attach_output = true,
+            "--shell" => {
+                let script = args.next().ok_or("--shell 后需要命令字符串")?;
+                if args.next().is_some() {
+                    return Err("--shell 不能与命令参数同时使用".into());
+                }
+                shell = Some(script);
                 break;
             }
-            _ => command.push(arg),
+            "-m" | "--message" => {
+                if !notify || attach_output || shell.is_some() {
+                    return Err("-m/--message 不能与命令执行选项同时使用".into());
+                }
+                let message = args.next().ok_or("-m/--message 后需要消息内容")?;
+                if message.is_empty() {
+                    return Err("消息不能为空".into());
+                }
+                if args.next().is_some() {
+                    return Err("-m/--message 后不能再指定命令或其他参数".into());
+                }
+                return Ok(Invocation::Message(message));
+            }
+            "--" => {
+                let command: Vec<_> = args.collect();
+                if command.is_empty() {
+                    return Err("`--` 后需要指定要执行的命令".into());
+                }
+                return Ok(Invocation::Run(Options {
+                    command,
+                    shell,
+                    notify,
+                    attach_output,
+                }));
+            }
+            _ if arg.starts_with('-') => return Err(format!("未知 qn 选项：{arg}")),
+            _ => {
+                let mut command = vec![arg];
+                command.extend(args);
+                return Ok(Invocation::Run(Options {
+                    command,
+                    shell,
+                    notify,
+                    attach_output,
+                }));
+            }
         }
     }
 
-    if shell.is_none() && command.is_empty() {
-        return Err("没有指定要执行的命令".into());
+    if let Some(shell) = shell {
+        return Ok(Invocation::Run(Options {
+            command: Vec::new(),
+            shell: Some(shell),
+            notify,
+            attach_output,
+        }));
     }
-    Ok(Options {
-        command,
-        shell,
-        notify,
-        attach_output,
-    })
+
+    Err("没有指定要执行的命令".into())
 }
 
 fn parse_shell_report(args: impl IntoIterator<Item = String>) -> Result<ShellReport, String> {
@@ -1007,7 +1078,16 @@ fn main() -> ExitCode {
     }
 
     let options = match parse_options() {
-        Ok(options) => options,
+        Ok(Invocation::Run(options)) => options,
+        Ok(Invocation::Message(message)) => {
+            return match notify(&message) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("错误: {error}");
+                    ExitCode::from(1)
+                }
+            };
+        }
         Err(error) => {
             eprintln!("错误: {error}");
             print_usage();
@@ -1067,12 +1147,65 @@ mod tests {
 
     #[test]
     fn parses_attach_output_before_command() {
-        let options = parse_options_from(["-a", "--no-notify", "echo", "hello"].map(String::from))
-            .expect("options should parse");
+        let invocation =
+            parse_options_from(["-a", "--no-notify", "echo", "hello"].map(String::from))
+                .expect("options should parse");
+        let Invocation::Run(options) = invocation else {
+            panic!("expected command invocation");
+        };
 
         assert!(options.attach_output);
         assert!(!options.notify);
         assert_eq!(options.command, ["echo", "hello"]);
+    }
+
+    #[test]
+    fn parses_direct_message() {
+        let invocation = parse_options_from(["--message", "部署完成"].map(String::from))
+            .expect("message should parse");
+        let Invocation::Message(message) = invocation else {
+            panic!("expected message invocation");
+        };
+
+        assert_eq!(message, "部署完成");
+    }
+
+    #[test]
+    fn rejects_unknown_qn_option_before_command() {
+        let error = parse_options_from(["-x", "echo"].map(String::from))
+            .expect_err("unknown qn option should fail");
+
+        assert_eq!(error, "未知 qn 选项：-x");
+    }
+
+    #[test]
+    fn passes_hyphenated_arguments_after_command_to_command() {
+        let invocation = parse_options_from(["echo", "--release", "-v"].map(String::from))
+            .expect("command should parse");
+        let Invocation::Run(options) = invocation else {
+            panic!("expected command invocation");
+        };
+
+        assert_eq!(options.command, ["echo", "--release", "-v"]);
+    }
+
+    #[test]
+    fn separator_allows_hyphenated_command_name() {
+        let invocation = parse_options_from(["--", "-x", "argument"].map(String::from))
+            .expect("command should parse");
+        let Invocation::Run(options) = invocation else {
+            panic!("expected command invocation");
+        };
+
+        assert_eq!(options.command, ["-x", "argument"]);
+    }
+
+    #[test]
+    fn rejects_empty_direct_message() {
+        let error = parse_options_from(["-m", ""].map(String::from))
+            .expect_err("empty message should fail");
+
+        assert_eq!(error, "消息不能为空");
     }
 
     #[test]
@@ -1234,6 +1367,10 @@ mod tests {
             assert!(integration.contains("function qn") || integration.contains("qn()"));
             assert!(integration.contains("__notify"));
             assert!(integration.contains(SHELL_INTEGRATION_ENV));
+            assert!(
+                integration.contains("--message"),
+                "{shell:?} integration should delegate direct messages"
+            );
         }
         assert!(ShellKind::from_name("sh").is_none());
     }
