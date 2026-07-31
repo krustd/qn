@@ -37,12 +37,11 @@ Without configuration, `qn` still runs commands but prints a reminder and skips 
 ```
 qn [-a|--attach-output] [--no-notify] <command> [args...]
 qn [-a|--attach-output] [--no-notify] --shell <command-string>
-qn -t|--text [--to <openid>] <content>
-qn -m|--markdown [--to <openid>] <content>
-qn -i|--image [--to <openid>] <path>
-qn -f|--file [--to <openid>] <path>
+qn -t|--text <content>
+qn -m|--markdown <content>
+qn -i|--image <path>
+qn -f|--file <path>
 qn --status
-qn config api-url <url>
 qn init
 qn init-shell <fish|bash|zsh>
 ```
@@ -55,7 +54,6 @@ qn init-shell <fish|bash|zsh>
 | `-m <content>`, `--markdown <content>` | Send Markdown without rewriting its content. |
 | `-i <path>`, `--image <path>` | Upload and send the path as an image message. |
 | `-f <path>`, `--file <path>` | Upload and send the path as a downloadable file attachment. |
-| `--to <openid>` | Target one direct action to an explicit recipient. |
 | `--status` | Print QQ Gateway and default-recipient binding status. |
 | `--` | Stop parsing `qn` options; the remaining arguments are the command to run. |
 
@@ -80,25 +78,17 @@ For ordinary command arguments, the executable starts the requested program dire
 
 It obtains values in this order:
 
-1. `QN_ENDPOINT` — the plain-text endpoint URL. If unset, `qn init` prompts for it; press Enter to use `https://krust.iepose.cn/task-completed`.
-2. `QN_API_URL` — the QQ Task Notifier API root used for Markdown, media, direct targeting, and status. If `QN_ENDPOINT` uses the default, it defaults to `https://krust.iepose.cn`; otherwise it may be left empty.
-3. `QN_TOKEN` — the required Bearer token, always prompted by `qn init`.
-4. Device name — defaults to the machine hostname. On macOS, if the hostname is `localhost`, qn uses the configured LocalHostName instead.
+1. `QN_ENDPOINT` — the QQ Task Notifier server root URL. If unset, `qn init` prompts for it; press Enter to use `https://krust.iepose.cn`.
+2. `QN_TOKEN` — the required Bearer token, always prompted by `qn init`.
+3. Device name — defaults to the machine hostname. On macOS, if the hostname is `localhost`, qn uses the configured LocalHostName instead.
 
-The resulting file contains `endpoint=...`, `token=...`, `name=...`, and, when configured, `api_url=...`. On Unix, files created by `qn` are written with permission `0600`. Running `qn init` replaces the file with the newly entered values.
-
-Existing installations can persist the API root without rerunning `init`:
-
-```bash
-qn config api-url https://krust.iepose.cn
-```
+The resulting file contains `endpoint=...`, `token=...`, and `name=...`. On Unix, files created by qn are written with permission `0600`. Running `qn init` replaces the file with the newly entered values. Existing configurations ending in `/task-completed` must run `qn init` once to switch to the server root URL.
 
 At notification time, these environment variables override the corresponding file values:
 
 | Environment variable | Config key | Purpose |
 |----------------------|------------|---------|
-| `QN_ENDPOINT` | `endpoint` | Plain-text HTTP endpoint URL |
-| `QN_API_URL` | `api_url` | QQ Task Notifier API root URL |
+| `QN_ENDPOINT` | `endpoint` | QQ Task Notifier server root URL |
 | `QN_TOKEN` | `token` | Bearer token |
 
 `name` has no environment-variable override. If it is missing from an existing config file, `qn` uses the hostname and appends it to the file.
@@ -127,7 +117,7 @@ After upgrading, run `qn init-shell <shell>` once for the current shell to updat
 
 ## Notification requests
 
-Wrapped commands and `qn -t` without `--to` use the exact `QN_ENDPOINT` URL and send JSON such as:
+qn sends wrapped commands and `qn -t` to `POST /v1/messages` under `QN_ENDPOINT`:
 
 ```http
 Authorization: Bearer <token>
@@ -138,17 +128,17 @@ Content-Type: application/json
 
 A nonzero command exit code changes `任务完成` to `任务失败`. With `--attach-output`, the summary also includes an `输出：` section containing the captured standard output and/or standard error.
 
-The remaining direct actions require `QN_API_URL` and use QQ Task Notifier's native API:
+All native routes use the same server root:
 
 | Action | Request |
 |--------|---------|
-| `qn -t ... --to <openid>` | `POST /v1/messages` with `content` and `openid` |
+| Wrapped command, `qn -t ...` | `POST /v1/messages` |
 | `qn -m ...` | `POST /v1/markdown` with verbatim `content` |
 | `qn -i ...` | `POST /v1/media` multipart form with `file_type=image` |
 | `qn -f ...` | `POST /v1/media` multipart form with `file_type=file` |
 | `qn --status` | `GET /status` |
 
-Any HTTP service that accepts the summary request format can be used for wrapped-command and unaddressed text notifications. [QQ Task Notifier](https://github.com/krustd/qq-task-notifier) provides the native API required by Markdown, media, targeting, and status.
+[QQ Task Notifier](https://github.com/krustd/qq-task-notifier) binds exactly one default recipient; qn does not allow callers to override it.
 
 ## How it works
 
