@@ -6,8 +6,9 @@ use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 use reqwest::blocking::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+const DEFAULT_API_URL: &str = "https://krust.iepose.cn";
 const DEFAULT_ENDPOINT: &str = "https://krust.iepose.cn/task-completed";
 const SHELL_INTEGRATION_ENV: &str = "QN_SHELL_INTEGRATION";
 
@@ -87,7 +88,7 @@ const FISH_SHELL_INIT: &str = r#"function qn
 
     if test (count $argv) -gt 0
         switch $argv[1]
-            case -h --help -m --message init init-shell __notify __is-configured
+            case -h --help -t --text -m --markdown -i --image -f --file --status config init init-shell __notify __is-configured
                 command qn $argv
                 return $status
         end
@@ -120,7 +121,7 @@ const FISH_SHELL_INIT: &str = r#"function qn
                     return $status
                 end
                 break
-            case -m --message
+            case -t --text -m --markdown -i --image -f --file --status config
                 command qn $qn_original
                 return $status
             case --
@@ -203,7 +204,7 @@ const BASH_SHELL_INIT: &str = r#"qn() {
     export QN_SHELL_INTEGRATION
 
     case "${1-}" in
-        -h|--help|-m|--message|init|init-shell|__notify|__is-configured)
+        -h|--help|-t|--text|-m|--markdown|-i|--image|-f|--file|--status|config|init|init-shell|__notify|__is-configured)
             command qn "$@"
             return $?
             ;;
@@ -229,7 +230,7 @@ const BASH_SHELL_INIT: &str = r#"qn() {
                 fi
                 break
                 ;;
-            -m|--message)
+            -t|--text|-m|--markdown|-i|--image|-f|--file|--status|config)
                 command qn "${qn_original[@]}"
                 return $?
                 ;;
@@ -290,7 +291,7 @@ const ZSH_SHELL_INIT: &str = r#"qn() {
     export QN_SHELL_INTEGRATION
 
     case "${1-}" in
-        -h|--help|-m|--message|init|init-shell|__notify|__is-configured)
+        -h|--help|-t|--text|-m|--markdown|-i|--image|-f|--file|--status|config|init|init-shell|__notify|__is-configured)
             command qn "$@"
             return $?
             ;;
@@ -317,7 +318,7 @@ const ZSH_SHELL_INIT: &str = r#"qn() {
                 fi
                 break
                 ;;
-            -m|--message)
+            -t|--text|-m|--markdown|-i|--image|-f|--file|--status|config)
                 command qn "${qn_original[@]}"
                 return $?
                 ;;
@@ -374,7 +375,20 @@ const ZSH_SHELL_INIT: &str = r#"qn() {
 #[derive(Debug)]
 enum Invocation {
     Run(Options),
-    Message(String),
+    Text {
+        content: String,
+        openid: Option<String>,
+    },
+    Markdown {
+        content: String,
+        openid: Option<String>,
+    },
+    Media {
+        path: PathBuf,
+        media_type: MediaType,
+        openid: Option<String>,
+    },
+    Status,
 }
 
 #[derive(Debug)]
@@ -403,6 +417,34 @@ struct ShellReport {
 #[derive(Serialize)]
 struct Notification<'a> {
     summary: &'a str,
+}
+
+#[derive(Serialize)]
+struct ApiMessage<'a> {
+    content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    openid: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaType {
+    Image,
+    File,
+}
+
+impl MediaType {
+    fn api_value(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::File => "file",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StatusResponse {
+    connected: bool,
+    bound: bool,
 }
 
 fn config_path() -> Result<PathBuf, String> {
@@ -435,6 +477,12 @@ fn configured_value(environment_name: &str, config_name: &str) -> Option<String>
 fn is_configured() -> bool {
     configured_value("QN_TOKEN", "token").is_some()
         && configured_value("QN_ENDPOINT", "endpoint").is_some()
+}
+
+fn api_url(path: &str) -> Result<String, String> {
+    let base_url = configured_value("QN_API_URL", "api_url")
+        .ok_or("未配置 QN_API_URL；请运行 `qn config api-url <url>` 或设置环境变量".to_owned())?;
+    Ok(format!("{}/{}", base_url.trim_end_matches('/'), path))
 }
 
 fn shell_integration_is_loaded() -> bool {
@@ -611,6 +659,51 @@ fn write_config_value(path: &Path, name: &str, value: &str) -> Result<(), String
     Ok(())
 }
 
+fn configure_api_url(args: &[String]) -> Result<String, String> {
+    if args.len() != 2 || args[0] != "api-url" {
+        return Err("用法：qn config api-url <url>".into());
+    }
+    let url = args[1].trim();
+    if url.is_empty() {
+        return Err("API URL 不能为空".into());
+    }
+    let path = config_path()?;
+    write_config_value(&path, "api_url", url)?;
+    Ok(format!("API URL 已保存：{url}"))
+}
+
+fn prompt_api_url(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    endpoint: &str,
+) -> Result<Option<String>, String> {
+    if let Ok(url) = env::var("QN_API_URL") {
+        if !url.trim().is_empty() {
+            return Ok(Some(url));
+        }
+    }
+    let default = (endpoint == DEFAULT_ENDPOINT).then_some(DEFAULT_API_URL);
+    match default {
+        Some(default) => writeln!(output, "请输入 QN_API_URL（默认 {default}）："),
+        None => writeln!(
+            output,
+            "请输入 QN_API_URL（用于 Markdown、图片、文件和状态；可留空）："
+        ),
+    }
+    .map_err(|error| error.to_string())?;
+    output.flush().map_err(|error| error.to_string())?;
+    let mut value = String::new();
+    input
+        .read_line(&mut value)
+        .map_err(|error| error.to_string())?;
+    let value = value.trim();
+    if value.is_empty() {
+        Ok(default.map(str::to_owned))
+    } else {
+        Ok(Some(value.to_owned()))
+    }
+}
+
 fn default_device_name() -> Result<String, String> {
     let name = hostname::get()
         .map_err(|error| format!("获取主机名失败: {error}"))?
@@ -667,6 +760,7 @@ fn initialize_config() -> Result<(), String> {
             }
         }
     };
+    let api_url = prompt_api_url(&mut input, &mut output, &endpoint)?;
     writeln!(output, "请输入 QN_TOKEN：").map_err(|error| error.to_string())?;
     output.flush().map_err(|error| error.to_string())?;
     let mut token = String::new();
@@ -693,11 +787,11 @@ fn initialize_config() -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    fs::write(
-        &path,
-        format!("endpoint={endpoint}\ntoken={token}\nname={name}\n"),
-    )
-    .map_err(|error| format!("写入配置失败: {error}"))?;
+    let mut config = format!("endpoint={endpoint}\ntoken={token}\nname={name}\n");
+    if let Some(api_url) = api_url {
+        config.push_str(&format!("api_url={api_url}\n"));
+    }
+    fs::write(&path, config).map_err(|error| format!("写入配置失败: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -716,18 +810,76 @@ fn print_usage() {
     eprintln!("用法:");
     eprintln!("  qn [-a|--attach-output] [--no-notify] <command> [args...]");
     eprintln!("  qn [-a|--attach-output] [--no-notify] --shell <command-string>");
-    eprintln!("  qn -m|--message <message>");
+    eprintln!("  qn -t|--text [--to <openid>] <content>");
+    eprintln!("  qn -m|--markdown [--to <openid>] <content>");
+    eprintln!("  qn -i|--image [--to <openid>] <path>");
+    eprintln!("  qn -f|--file [--to <openid>] <path>");
+    eprintln!("  qn --status");
+    eprintln!("  qn config api-url <url>");
     eprintln!("  qn init");
     eprintln!("  qn init-shell <fish|bash|zsh>");
     eprintln!();
     eprintln!("选项:");
     eprintln!("  -a, --attach-output  在通知中附带命令的标准输出和标准错误");
     eprintln!("  --no-notify          不发送完成通知");
-    eprintln!("  -m, --message        直接发送消息，不执行命令");
+    eprintln!("  -t, --text           直接发送纯文本消息");
+    eprintln!("  -m, --markdown       直接发送 Markdown 消息");
+    eprintln!("  -i, --image          上传并以图片消息发送");
+    eprintln!("  -f, --file           上传并以文件附件发送");
+    eprintln!("  --to <openid>        指定本次消息的接收人");
+    eprintln!("  --status             查看 QQ Gateway 与默认接收人状态");
     eprintln!();
     eprintln!("环境变量:");
-    eprintln!("  QN_ENDPOINT  通知接口 URL（`qn init` 时留空则默认 {DEFAULT_ENDPOINT}）");
+    eprintln!("  QN_ENDPOINT  文本通知接口 URL（`qn init` 时留空则默认 {DEFAULT_ENDPOINT}）");
+    eprintln!("  QN_API_URL   QQ Task Notifier API 根 URL（默认 {DEFAULT_API_URL}）");
     eprintln!("  QN_TOKEN     通知接口 Bearer Token");
+}
+
+fn direct_options_are_allowed(
+    notify: bool,
+    attach_output: bool,
+    shell: Option<&String>,
+) -> Result<(), String> {
+    if !notify || attach_output || shell.is_some() {
+        Err("直接发送选项不能与命令执行选项同时使用".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_direct_arguments(
+    mut args: impl Iterator<Item = String>,
+    value_name: &str,
+) -> Result<(String, Option<String>), String> {
+    let mut value = None;
+    let mut openid = None;
+
+    while let Some(argument) = args.next() {
+        if argument == "--to" {
+            let recipient = args.next().ok_or("--to 后需要 openid")?;
+            if recipient.is_empty() {
+                return Err("openid 不能为空".into());
+            }
+            if openid.replace(recipient).is_some() {
+                return Err("--to 只能指定一次".into());
+            }
+        } else if argument == "--" {
+            let content = args.next().ok_or_else(|| format!("{value_name}不能为空"))?;
+            if args.next().is_some() || value.replace(content).is_some() {
+                return Err(format!("只能指定一个{value_name}"));
+            }
+        } else if argument.starts_with('-') {
+            return Err(format!("未知发送选项：{argument}"));
+        } else if value.replace(argument).is_some() {
+            return Err(format!("只能指定一个{value_name}"));
+        }
+    }
+
+    let value = value.ok_or_else(|| format!("{value_name}不能为空"))?;
+    if value.is_empty() {
+        return Err(format!("{value_name}不能为空"));
+    }
+    Ok((value, openid))
 }
 
 fn parse_options() -> Result<Invocation, String> {
@@ -756,18 +908,40 @@ fn parse_options_from(args: impl IntoIterator<Item = String>) -> Result<Invocati
                 shell = Some(script);
                 break;
             }
-            "-m" | "--message" => {
-                if !notify || attach_output || shell.is_some() {
-                    return Err("-m/--message 不能与命令执行选项同时使用".into());
-                }
-                let message = args.next().ok_or("-m/--message 后需要消息内容")?;
-                if message.is_empty() {
-                    return Err("消息不能为空".into());
-                }
+            "-t" | "--text" => {
+                direct_options_are_allowed(notify, attach_output, shell.as_ref())?;
+                let (content, openid) = parse_direct_arguments(args, "消息内容")?;
+                return Ok(Invocation::Text { content, openid });
+            }
+            "-m" | "--markdown" => {
+                direct_options_are_allowed(notify, attach_output, shell.as_ref())?;
+                let (content, openid) = parse_direct_arguments(args, "Markdown 内容")?;
+                return Ok(Invocation::Markdown { content, openid });
+            }
+            "-i" | "--image" => {
+                direct_options_are_allowed(notify, attach_output, shell.as_ref())?;
+                let (path, openid) = parse_direct_arguments(args, "图片路径")?;
+                return Ok(Invocation::Media {
+                    path: PathBuf::from(path),
+                    media_type: MediaType::Image,
+                    openid,
+                });
+            }
+            "-f" | "--file" => {
+                direct_options_are_allowed(notify, attach_output, shell.as_ref())?;
+                let (path, openid) = parse_direct_arguments(args, "文件路径")?;
+                return Ok(Invocation::Media {
+                    path: PathBuf::from(path),
+                    media_type: MediaType::File,
+                    openid,
+                });
+            }
+            "--status" => {
+                direct_options_are_allowed(notify, attach_output, shell.as_ref())?;
                 if args.next().is_some() {
-                    return Err("-m/--message 后不能再指定命令或其他参数".into());
+                    return Err("--status 不能指定其他参数".into());
                 }
-                return Ok(Invocation::Message(message));
+                return Ok(Invocation::Status);
             }
             "--" => {
                 let command: Vec<_> = args.collect();
@@ -1009,9 +1183,13 @@ fn notification_summary(device_name: &str, summary: &str) -> String {
     format!("{device_name}\n{summary}")
 }
 
+fn api_token() -> Result<String, String> {
+    configured_value("QN_TOKEN", "token")
+        .ok_or("未配置 QN_TOKEN，请运行 `qn init` 或设置环境变量".to_owned())
+}
+
 fn notify(summary: &str) -> Result<(), String> {
-    let token = configured_value("QN_TOKEN", "token")
-        .ok_or("未配置 QN_TOKEN，请运行 `qn init` 或设置环境变量".to_owned())?;
+    let token = api_token()?;
     let endpoint = configured_value("QN_ENDPOINT", "endpoint")
         .ok_or("未配置 QN_ENDPOINT，请运行 `qn init` 或设置环境变量".to_owned())?;
     let summary = notification_summary(&device_name()?, summary);
@@ -1026,6 +1204,75 @@ fn notify(summary: &str) -> Result<(), String> {
         .map_err(|error| format!("通知接口返回错误: {error}"))
 }
 
+fn notify_text(content: &str, openid: Option<&str>) -> Result<(), String> {
+    let Some(openid) = openid else {
+        return notify(content);
+    };
+    let content = notification_summary(&device_name()?, content);
+    Client::new()
+        .post(api_url("v1/messages")?)
+        .bearer_auth(api_token()?)
+        .json(&ApiMessage {
+            content: &content,
+            openid: Some(openid),
+        })
+        .send()
+        .map_err(|error| format!("发送文本消息失败: {error}"))?
+        .error_for_status()
+        .map(|_| ())
+        .map_err(|error| format!("文本消息接口返回错误: {error}"))
+}
+
+fn notify_markdown(content: &str, openid: Option<&str>) -> Result<(), String> {
+    Client::new()
+        .post(api_url("v1/markdown")?)
+        .bearer_auth(api_token()?)
+        .json(&ApiMessage { content, openid })
+        .send()
+        .map_err(|error| format!("发送 Markdown 消息失败: {error}"))?
+        .error_for_status()
+        .map(|_| ())
+        .map_err(|error| format!("Markdown 消息接口返回错误: {error}"))
+}
+
+fn send_media(path: &Path, media_type: MediaType, openid: Option<&str>) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("文件路径必须包含有效文件名：{}", path.display()))?;
+    let file = fs::File::open(path)
+        .map_err(|error| format!("读取文件失败（{}）: {error}", path.display()))?;
+    let part = reqwest::blocking::multipart::Part::reader(file).file_name(file_name.to_owned());
+    let mut form = reqwest::blocking::multipart::Form::new()
+        .part("file", part)
+        .text("file_type", media_type.api_value().to_owned());
+    if let Some(openid) = openid {
+        form = form.text("openid", openid.to_owned());
+    }
+    Client::new()
+        .post(api_url("v1/media")?)
+        .bearer_auth(api_token()?)
+        .multipart(form)
+        .send()
+        .map_err(|error| format!("上传{}失败: {error}", media_type.api_value()))?
+        .error_for_status()
+        .map(|_| ())
+        .map_err(|error| format!("媒体接口返回错误: {error}"))
+}
+
+fn fetch_status() -> Result<StatusResponse, String> {
+    Client::new()
+        .get(api_url("status")?)
+        .bearer_auth(api_token()?)
+        .send()
+        .map_err(|error| format!("查询状态失败: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("状态接口返回错误: {error}"))?
+        .json()
+        .map_err(|error| format!("状态接口返回无效 JSON: {error}"))
+}
+
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().skip(1).collect();
     if raw_args.len() == 1 && raw_args[0] == "init" {
@@ -1034,6 +1281,21 @@ fn main() -> ExitCode {
             Err(error) => {
                 eprintln!("错误: {error}");
                 ExitCode::from(1)
+            }
+        };
+    }
+    if raw_args
+        .first()
+        .is_some_and(|argument| argument == "config")
+    {
+        return match configure_api_url(&raw_args[1..]) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("错误: {error}");
+                ExitCode::from(2)
             }
         };
     }
@@ -1078,9 +1340,43 @@ fn main() -> ExitCode {
 
     let options = match parse_options() {
         Ok(Invocation::Run(options)) => options,
-        Ok(Invocation::Message(message)) => {
-            return match notify(&message) {
+        Ok(Invocation::Text { content, openid }) => {
+            return match notify_text(&content, openid.as_deref()) {
                 Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("错误: {error}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        Ok(Invocation::Markdown { content, openid }) => {
+            return match notify_markdown(&content, openid.as_deref()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("错误: {error}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        Ok(Invocation::Media {
+            path,
+            media_type,
+            openid,
+        }) => {
+            return match send_media(&path, media_type, openid.as_deref()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("错误: {error}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        Ok(Invocation::Status) => {
+            return match fetch_status() {
+                Ok(status) => {
+                    println!("connected={}\nbound={}", status.connected, status.bound);
+                    ExitCode::SUCCESS
+                }
                 Err(error) => {
                     eprintln!("错误: {error}");
                     ExitCode::from(1)
@@ -1159,14 +1455,70 @@ mod tests {
     }
 
     #[test]
-    fn parses_direct_message() {
-        let invocation = parse_options_from(["--message", "部署完成"].map(String::from))
-            .expect("message should parse");
-        let Invocation::Message(message) = invocation else {
-            panic!("expected message invocation");
+    fn parses_direct_text_with_recipient() {
+        let invocation =
+            parse_options_from(["--text", "部署完成", "--to", "openid-1"].map(String::from))
+                .expect("text invocation should parse");
+        let Invocation::Text { content, openid } = invocation else {
+            panic!("expected text invocation");
         };
 
-        assert_eq!(message, "部署完成");
+        assert_eq!(content, "部署完成");
+        assert_eq!(openid.as_deref(), Some("openid-1"));
+    }
+
+    #[test]
+    fn parses_markdown_without_rewriting_content() {
+        let invocation = parse_options_from(["-m", "# 部署完成"].map(String::from))
+            .expect("markdown invocation should parse");
+        let Invocation::Markdown { content, openid } = invocation else {
+            panic!("expected markdown invocation");
+        };
+
+        assert_eq!(content, "# 部署完成");
+        assert!(openid.is_none());
+    }
+
+    #[test]
+    fn parses_image_and_file_as_distinct_media_types() {
+        let image = parse_options_from(["-i", "preview.png"].map(String::from))
+            .expect("image invocation should parse");
+        let file =
+            parse_options_from(["--file", "report.pdf", "--to", "openid-2"].map(String::from))
+                .expect("file invocation should parse");
+
+        let Invocation::Media {
+            path,
+            media_type,
+            openid,
+        } = image
+        else {
+            panic!("expected image invocation");
+        };
+        assert_eq!(path, PathBuf::from("preview.png"));
+        assert_eq!(media_type, MediaType::Image);
+        assert!(openid.is_none());
+
+        let Invocation::Media {
+            path,
+            media_type,
+            openid,
+        } = file
+        else {
+            panic!("expected file invocation");
+        };
+        assert_eq!(path, PathBuf::from("report.pdf"));
+        assert_eq!(media_type, MediaType::File);
+        assert_eq!(openid.as_deref(), Some("openid-2"));
+    }
+
+    #[test]
+    fn parses_status_and_uses_explicit_media_api_values() {
+        let invocation =
+            parse_options_from(["--status"].map(String::from)).expect("status should parse");
+        assert!(matches!(invocation, Invocation::Status));
+        assert_eq!(MediaType::Image.api_value(), "image");
+        assert_eq!(MediaType::File.api_value(), "file");
     }
 
     #[test]
@@ -1200,11 +1552,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_direct_message() {
-        let error = parse_options_from(["-m", ""].map(String::from))
-            .expect_err("empty message should fail");
+    fn rejects_invalid_direct_message_arguments() {
+        let empty =
+            parse_options_from(["-t", ""].map(String::from)).expect_err("empty text should fail");
+        assert_eq!(empty, "消息内容不能为空");
 
-        assert_eq!(error, "消息不能为空");
+        let multiple = parse_options_from(["-m", "first", "second"].map(String::from))
+            .expect_err("multiple markdown values should fail");
+        assert_eq!(multiple, "只能指定一个Markdown 内容");
+
+        let mixed = parse_options_from(["--no-notify", "-i", "preview.png"].map(String::from))
+            .expect_err("direct invocation cannot use command options");
+        assert_eq!(mixed, "直接发送选项不能与命令执行选项同时使用");
     }
 
     #[test]
@@ -1366,10 +1725,12 @@ mod tests {
             assert!(integration.contains("function qn") || integration.contains("qn()"));
             assert!(integration.contains("__notify"));
             assert!(integration.contains(SHELL_INTEGRATION_ENV));
-            assert!(
-                integration.contains("--message"),
-                "{shell:?} integration should delegate direct messages"
-            );
+            for option in ["--text", "--markdown", "--image", "--file", "--status"] {
+                assert!(
+                    integration.contains(option),
+                    "{shell:?} integration should delegate {option}"
+                );
+            }
         }
         assert!(ShellKind::from_name("sh").is_none());
     }

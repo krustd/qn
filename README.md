@@ -18,23 +18,31 @@ Configure an endpoint, token, and device name in an interactive terminal:
 qn init
 ```
 
-Then run a command through `qn`, or send a message directly:
+Then run a command through `qn`, or send text, Markdown, images, and files directly:
 
 ```bash
 qn sleep 30
 qn make -j12
 qn --shell "git push && cargo build --release"
-qn -m "预览环境部署完成"
+qn -t "预览环境部署完成"
+qn -m "# 预览环境部署完成"
+qn -i ./preview.png
+qn -f ./report.pdf
 ```
 
-Without configuration, `qn` still runs commands but prints a reminder and skips their notifications. Direct messages require configuration and fail if they cannot be sent.
+Without configuration, `qn` still runs commands but prints a reminder and skips their notifications. Direct actions require configuration and fail if they cannot be sent.
 
 ## Usage
 
 ```
 qn [-a|--attach-output] [--no-notify] <command> [args...]
 qn [-a|--attach-output] [--no-notify] --shell <command-string>
-qn -m|--message <message>
+qn -t|--text [--to <openid>] <content>
+qn -m|--markdown [--to <openid>] <content>
+qn -i|--image [--to <openid>] <path>
+qn -f|--file [--to <openid>] <path>
+qn --status
+qn config api-url <url>
 qn init
 qn init-shell <fish|bash|zsh>
 ```
@@ -43,9 +51,15 @@ qn init-shell <fish|bash|zsh>
 |--------|----------|
 | `-a`, `--attach-output` | Capture standard output and standard error, replay them after the command exits, and add them to the notification. Output is therefore not streamed live while the command runs. |
 | `--no-notify` | Run the command without checking configuration or sending a notification. |
-| `--shell <command-string>` | Run the string with `sh -c` on non-Windows systems (`cmd /C` on Windows) when using the executable directly. With shell integration loaded, the string is evaluated by the current shell instead. |
-| `-m <message>`, `--message <message>` | Send a message directly without running a command. The message must not be empty. A send failure exits with status `1`. |
+| `-t <content>`, `--text <content>` | Send a plain-text message without running a command. The device name is prefixed to the content. |
+| `-m <content>`, `--markdown <content>` | Send Markdown without rewriting its content. |
+| `-i <path>`, `--image <path>` | Upload and send the path as an image message. |
+| `-f <path>`, `--file <path>` | Upload and send the path as a downloadable file attachment. |
+| `--to <openid>` | Target one direct action to an explicit recipient. |
+| `--status` | Print QQ Gateway and default-recipient binding status. |
 | `--` | Stop parsing `qn` options; the remaining arguments are the command to run. |
+
+`-t`, `-m`, `-i`, `-f`, and `--status` are direct actions. They cannot be combined with command-execution options. Image and file mode are explicit: `qn -f image.png` sends a downloadable attachment, while `qn -i unknown.bin` requests an image message.
 
 Before the command name, every argument beginning with `-` belongs to `qn`. Unknown `qn` options are rejected with status `2` and never run the following command. After the command name, arguments are passed through unchanged:
 
@@ -66,17 +80,25 @@ For ordinary command arguments, the executable starts the requested program dire
 
 It obtains values in this order:
 
-1. `QN_ENDPOINT` — the endpoint URL. If this environment variable is unset, `qn init` prompts for it; press Enter to use the default, `https://krust.iepose.cn/task-completed`.
-2. `QN_TOKEN` — the required Bearer token, always prompted by `qn init`.
-3. Device name — defaults to the machine hostname.
+1. `QN_ENDPOINT` — the plain-text endpoint URL. If unset, `qn init` prompts for it; press Enter to use `https://krust.iepose.cn/task-completed`.
+2. `QN_API_URL` — the QQ Task Notifier API root used for Markdown, media, direct targeting, and status. If `QN_ENDPOINT` uses the default, it defaults to `https://krust.iepose.cn`; otherwise it may be left empty.
+3. `QN_TOKEN` — the required Bearer token, always prompted by `qn init`.
+4. Device name — defaults to the machine hostname.
 
-The resulting file contains `endpoint=...`, `token=...`, and `name=...`. On Unix, files created by `qn` are written with permission `0600`. Running `qn init` replaces the file with the newly entered values.
+The resulting file contains `endpoint=...`, `token=...`, `name=...`, and, when configured, `api_url=...`. On Unix, files created by `qn` are written with permission `0600`. Running `qn init` replaces the file with the newly entered values.
 
-At notification time, only these environment variables override the corresponding file values:
+Existing installations can persist the API root without rerunning `init`:
+
+```bash
+qn config api-url https://krust.iepose.cn
+```
+
+At notification time, these environment variables override the corresponding file values:
 
 | Environment variable | Config key | Purpose |
 |----------------------|------------|---------|
-| `QN_ENDPOINT` | `endpoint` | HTTP endpoint URL |
+| `QN_ENDPOINT` | `endpoint` | Plain-text HTTP endpoint URL |
+| `QN_API_URL` | `api_url` | QQ Task Notifier API root URL |
 | `QN_TOKEN` | `token` | Bearer token |
 
 `name` has no environment-variable override. If it is missing from an existing config file, `qn` uses the hostname and appends it to the file.
@@ -101,11 +123,11 @@ qn init-shell zsh
 | Bash | `~/.bashrc` |
 | Zsh | `~/.zshrc` |
 
-After upgrading, run `qn init-shell <shell>` once for the current shell to update its function block, including direct-message and option validation support.
+After upgrading, run `qn init-shell <shell>` once for the current shell to update its function block, including direct-action and option validation support.
 
-## Notification request
+## Notification requests
 
-`qn` sends one HTTP `POST` request to the configured endpoint after a command completes, or immediately for `-m` / `--message`. The endpoint path is part of `QN_ENDPOINT`; `/task-completed` is only the path in the default URL.
+Wrapped commands and `qn -t` without `--to` use the exact `QN_ENDPOINT` URL and send JSON such as:
 
 ```http
 Authorization: Bearer <token>
@@ -114,16 +136,26 @@ Content-Type: application/json
 {"summary":"device-name\n任务完成\n命令：make -j12\n退出码：0\n耗时：2m 15s\n工作目录：/home/me/project"}
 ```
 
-The JSON body always has one `summary` string. A nonzero command exit code changes `任务完成` to `任务失败`. With `--attach-output`, the summary also includes an `输出：` section containing the captured standard output and/or standard error. With `-m` / `--message`, the summary is `device-name`, a newline, and the supplied message without task metadata.
+A nonzero command exit code changes `任务完成` to `任务失败`. With `--attach-output`, the summary also includes an `输出：` section containing the captured standard output and/or standard error.
 
-Any HTTP service that accepts this request format can be used. [QQ Task Notifier](https://github.com/krustd/qq-task-notifier) is an optional companion service for forwarding these notifications to QQ.
+The remaining direct actions require `QN_API_URL` and use QQ Task Notifier's native API:
+
+| Action | Request |
+|--------|---------|
+| `qn -t ... --to <openid>` | `POST /v1/messages` with `content` and `openid` |
+| `qn -m ...` | `POST /v1/markdown` with verbatim `content` |
+| `qn -i ...` | `POST /v1/media` multipart form with `file_type=image` |
+| `qn -f ...` | `POST /v1/media` multipart form with `file_type=file` |
+| `qn --status` | `GET /status` |
+
+Any HTTP service that accepts the summary request format can be used for wrapped-command and unaddressed text notifications. [QQ Task Notifier](https://github.com/krustd/qq-task-notifier) provides the native API required by Markdown, media, targeting, and status.
 
 ## How it works
 
 1. For a command invocation, `qn` runs the requested command and records its exit code and elapsed time.
-2. For `-m` / `--message`, it uses the supplied message directly.
-3. It adds the configured device name and sends `{"summary": ...}` with Bearer authentication.
-4. A command-notification transport error or non-success HTTP status is reported as a warning; the wrapped command's exit code is retained. A direct-message delivery error exits with status `1`.
+2. Direct actions submit their requested text, Markdown, image, file, or status operation immediately.
+3. Wrapped commands and plain text add the configured device name; Markdown content is sent unchanged.
+4. A command-notification transport error or non-success HTTP status is reported as a warning; the wrapped command's exit code is retained. Direct-action delivery errors exit with status `1`.
 
 ## License
 
