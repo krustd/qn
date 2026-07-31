@@ -83,7 +83,7 @@ It obtains values in this order:
 1. `QN_ENDPOINT` — the plain-text endpoint URL. If unset, `qn init` prompts for it; press Enter to use `https://krust.iepose.cn/task-completed`.
 2. `QN_API_URL` — the QQ Task Notifier API root used for Markdown, media, direct targeting, and status. If `QN_ENDPOINT` uses the default, it defaults to `https://krust.iepose.cn`; otherwise it may be left empty.
 3. `QN_TOKEN` — the required Bearer token, always prompted by `qn init`.
-4. Device name — defaults to the machine hostname.
+4. Device name — defaults to the machine hostname. On macOS, if the hostname is `localhost`, qn uses the configured LocalHostName instead.
 
 The resulting file contains `endpoint=...`, `token=...`, `name=...`, and, when configured, `api_url=...`. On Unix, files created by `qn` are written with permission `0600`. Running `qn init` replaces the file with the newly entered values.
 

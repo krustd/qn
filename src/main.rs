@@ -704,17 +704,54 @@ fn prompt_api_url(
     }
 }
 
-fn default_device_name() -> Result<String, String> {
-    let name = hostname::get()
-        .map_err(|error| format!("获取主机名失败: {error}"))?
-        .to_string_lossy()
-        .trim()
-        .to_owned();
-    if name.is_empty() {
+fn macos_local_hostname() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("scutil")
+            .args(["--get", "LocalHostName"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return String::from_utf8(output.stdout)
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn select_default_device_name(
+    hostname: String,
+    local_hostname: Option<String>,
+) -> Result<String, String> {
+    let hostname = hostname.trim().to_owned();
+    if !hostname.is_empty() && !hostname.eq_ignore_ascii_case("localhost") {
+        return Ok(hostname);
+    }
+    if let Some(local_hostname) = local_hostname
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("localhost"))
+    {
+        return Ok(local_hostname);
+    }
+    if hostname.is_empty() {
         Err("主机名为空，无法设置设备名称".into())
     } else {
-        Ok(name)
+        Ok(hostname)
     }
+}
+
+fn default_device_name() -> Result<String, String> {
+    let hostname = hostname::get()
+        .map_err(|error| format!("获取主机名失败: {error}"))?
+        .to_string_lossy()
+        .into_owned();
+    select_default_device_name(hostname, macos_local_hostname())
 }
 
 fn device_name_from_config(path: &Path) -> Result<String, String> {
@@ -1602,6 +1639,22 @@ mod tests {
         assert_eq!(
             notification_summary("MacBook-Pro", "任务完成\n命令：echo hello"),
             "MacBook-Pro\n任务完成\n命令：echo hello"
+        );
+    }
+
+    #[test]
+    fn replaces_localhost_with_macos_local_hostname() {
+        assert_eq!(
+            select_default_device_name("localhost".into(), Some("Krust-MacBook-Pro".into())),
+            Ok("Krust-MacBook-Pro".into())
+        );
+    }
+
+    #[test]
+    fn preserves_non_localhost_hostname() {
+        assert_eq!(
+            select_default_device_name("build-server".into(), Some("MacBook-Pro".into())),
+            Ok("build-server".into())
         );
     }
 
