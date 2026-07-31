@@ -828,11 +828,6 @@ fn print_usage() {
     eprintln!("  -f, --file           上传并以文件附件发送");
     eprintln!("  --to <openid>        指定本次消息的接收人");
     eprintln!("  --status             查看 QQ Gateway 与默认接收人状态");
-    eprintln!();
-    eprintln!("环境变量:");
-    eprintln!("  QN_ENDPOINT  文本通知接口 URL（`qn init` 时留空则默认 {DEFAULT_ENDPOINT}）");
-    eprintln!("  QN_API_URL   QQ Task Notifier API 根 URL（默认 {DEFAULT_API_URL}）");
-    eprintln!("  QN_TOKEN     通知接口 Bearer Token");
 }
 
 fn direct_options_are_allowed(
@@ -1188,6 +1183,21 @@ fn api_token() -> Result<String, String> {
         .ok_or("未配置 QN_TOKEN，请运行 `qn init` 或设置环境变量".to_owned())
 }
 
+fn notification_error(action: &str, error: reqwest::Error) -> String {
+    if let Some(status) = error.status() {
+        return match status.as_u16() {
+            401 | 403 => format!("{action}鉴权失败（HTTP {status}）；请运行 `qn init` 更新配置"),
+            404 => format!("{action}的接口不存在（HTTP 404）；请运行 `qn init` 检查 endpoint 配置"),
+            412 => format!("{action}失败：默认接收人尚未绑定；请先向机器人发送一条私聊消息"),
+            _ => format!("{action}失败（HTTP {status}）：{error}"),
+        };
+    }
+    if error.is_connect() || error.is_timeout() {
+        return format!("{action}无法连接通知服务；请检查 endpoint，必要时运行 `qn init`：{error}");
+    }
+    format!("{action}失败: {error}")
+}
+
 fn notify(summary: &str) -> Result<(), String> {
     let token = api_token()?;
     let endpoint = configured_value("QN_ENDPOINT", "endpoint")
@@ -1198,10 +1208,10 @@ fn notify(summary: &str) -> Result<(), String> {
         .bearer_auth(token)
         .json(&Notification { summary: &summary })
         .send()
-        .map_err(|error| format!("发送通知失败: {error}"))?
+        .map_err(|error| notification_error("发送通知", error))?
         .error_for_status()
         .map(|_| ())
-        .map_err(|error| format!("通知接口返回错误: {error}"))
+        .map_err(|error| notification_error("发送通知", error))
 }
 
 fn notify_text(content: &str, openid: Option<&str>) -> Result<(), String> {
@@ -1217,10 +1227,10 @@ fn notify_text(content: &str, openid: Option<&str>) -> Result<(), String> {
             openid: Some(openid),
         })
         .send()
-        .map_err(|error| format!("发送文本消息失败: {error}"))?
+        .map_err(|error| notification_error("发送文本消息", error))?
         .error_for_status()
         .map(|_| ())
-        .map_err(|error| format!("文本消息接口返回错误: {error}"))
+        .map_err(|error| notification_error("发送文本消息", error))
 }
 
 fn notify_markdown(content: &str, openid: Option<&str>) -> Result<(), String> {
@@ -1229,10 +1239,10 @@ fn notify_markdown(content: &str, openid: Option<&str>) -> Result<(), String> {
         .bearer_auth(api_token()?)
         .json(&ApiMessage { content, openid })
         .send()
-        .map_err(|error| format!("发送 Markdown 消息失败: {error}"))?
+        .map_err(|error| notification_error("发送 Markdown 消息", error))?
         .error_for_status()
         .map(|_| ())
-        .map_err(|error| format!("Markdown 消息接口返回错误: {error}"))
+        .map_err(|error| notification_error("发送 Markdown 消息", error))
 }
 
 fn send_media(path: &Path, media_type: MediaType, openid: Option<&str>) -> Result<(), String> {
@@ -1255,10 +1265,10 @@ fn send_media(path: &Path, media_type: MediaType, openid: Option<&str>) -> Resul
         .bearer_auth(api_token()?)
         .multipart(form)
         .send()
-        .map_err(|error| format!("上传{}失败: {error}", media_type.api_value()))?
+        .map_err(|error| notification_error("上传媒体", error))?
         .error_for_status()
         .map(|_| ())
-        .map_err(|error| format!("媒体接口返回错误: {error}"))
+        .map_err(|error| notification_error("上传媒体", error))
 }
 
 fn fetch_status() -> Result<StatusResponse, String> {
@@ -1266,9 +1276,9 @@ fn fetch_status() -> Result<StatusResponse, String> {
         .get(api_url("status")?)
         .bearer_auth(api_token()?)
         .send()
-        .map_err(|error| format!("查询状态失败: {error}"))?
+        .map_err(|error| notification_error("查询状态", error))?
         .error_for_status()
-        .map_err(|error| format!("状态接口返回错误: {error}"))?
+        .map_err(|error| notification_error("查询状态", error))?
         .json()
         .map_err(|error| format!("状态接口返回无效 JSON: {error}"))
 }
