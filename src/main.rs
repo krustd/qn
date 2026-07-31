@@ -724,7 +724,6 @@ fn print_usage() {
     eprintln!("  -a, --attach-output  在通知中附带命令的标准输出和标准错误");
     eprintln!("  --no-notify          不发送完成通知");
     eprintln!("  -m, --message        直接发送消息，不执行命令");
-    eprintln!("  --                   结束 qn 选项；其后的第一个参数是要执行的命令");
     eprintln!();
     eprintln!("环境变量:");
     eprintln!("  QN_ENDPOINT  通知接口 URL（`qn init` 时留空则默认 {DEFAULT_ENDPOINT}）");
