@@ -43,7 +43,7 @@ qn -i|--image <path>
 qn -f|--file <path>
 qn --status
 qn init
-qn init-shell <fish|bash|zsh>
+qn init-shell <fish|bash|zsh|powershell>
 ```
 
 | Option | Behavior |
@@ -103,10 +103,11 @@ Shell integration is optional. It makes `qn <command>` a shell function, so shel
 
 Install it explicitly for one of the supported shells:
 
-```bash
+```text
 qn init-shell fish
 qn init-shell bash
 qn init-shell zsh
+qn init-shell powershell
 ```
 
 `init-shell` does not auto-detect the shell. It writes a qn-managed function block to the selected startup file; rerunning it updates that block in place instead of appending a duplicate. Restart the selected shell after installation:
@@ -116,7 +117,9 @@ qn init-shell zsh
 | Fish | `~/.config/fish/config.fish` |
 | Bash | `~/.bashrc` |
 | Zsh | `~/.zshrc` |
+| PowerShell (Windows) | `$PROFILE.CurrentUserCurrentHost` |
 
+`qn init-shell powershell` asks Windows PowerShell for its current-user profile path and writes the managed function block there. Open a new PowerShell session after installation.
 After upgrading, run `qn init-shell <shell>` once for the current shell to update its function block, including direct-action and option validation support.
 
 ## Notification requests

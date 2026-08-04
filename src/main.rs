@@ -17,6 +17,7 @@ enum ShellKind {
     Fish,
     Bash,
     Zsh,
+    PowerShell,
 }
 
 impl ShellKind {
@@ -29,6 +30,9 @@ impl ShellKind {
             Some("fish") => Some(Self::Fish),
             Some("bash") => Some(Self::Bash),
             Some("zsh") => Some(Self::Zsh),
+            Some("powershell") | Some("powershell.exe") | Some("pwsh") | Some("pwsh.exe") => {
+                Some(Self::PowerShell)
+            }
             _ => None,
         }
     }
@@ -38,6 +42,7 @@ impl ShellKind {
             "fish" => Some(Self::Fish),
             "bash" => Some(Self::Bash),
             "zsh" => Some(Self::Zsh),
+            "powershell" => Some(Self::PowerShell),
             _ => None,
         }
     }
@@ -47,6 +52,7 @@ impl ShellKind {
             Self::Fish => "Fish",
             Self::Bash => "Bash",
             Self::Zsh => "Zsh",
+            Self::PowerShell => "PowerShell",
         }
     }
 
@@ -55,6 +61,7 @@ impl ShellKind {
             Self::Fish => "qn shell-init fish | source",
             Self::Bash => "eval \"$(qn shell-init bash)\"",
             Self::Zsh => "eval \"$(qn shell-init zsh)\"",
+            Self::PowerShell => "qn shell-init powershell | Invoke-Expression",
         }
     }
 
@@ -63,14 +70,21 @@ impl ShellKind {
             Self::Fish => FISH_SHELL_INIT,
             Self::Bash => BASH_SHELL_INIT,
             Self::Zsh => ZSH_SHELL_INIT,
+            Self::PowerShell => POWERSHELL_SHELL_INIT,
         }
     }
 
-    fn startup_config_path(self, home: &Path) -> PathBuf {
+    fn startup_config_path(self) -> Result<PathBuf, String> {
+        let home = || {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| "无法确定用户目录，请设置 HOME".to_owned())
+        };
         match self {
-            Self::Fish => home.join(".config/fish/config.fish"),
-            Self::Bash => home.join(".bashrc"),
-            Self::Zsh => home.join(".zshrc"),
+            Self::Fish => Ok(home()?.join(".config/fish/config.fish")),
+            Self::Bash => Ok(home()?.join(".bashrc")),
+            Self::Zsh => Ok(home()?.join(".zshrc")),
+            Self::PowerShell => powershell_profile_path(),
         }
     }
 
@@ -79,8 +93,40 @@ impl ShellKind {
             Self::Fish => "qn init-shell fish",
             Self::Bash => "qn init-shell bash",
             Self::Zsh => "qn init-shell zsh",
+            Self::PowerShell => "qn init-shell powershell",
         }
     }
+}
+
+#[cfg(windows)]
+fn powershell_profile_path() -> Result<PathBuf, String> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::Out.Write($PROFILE.CurrentUserCurrentHost)",
+        ])
+        .output()
+        .map_err(|error| format!("无法启动 PowerShell：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法确定 PowerShell Profile 路径：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let path = String::from_utf8(output.stdout)
+        .map_err(|error| format!("PowerShell Profile 路径不是有效 UTF-8：{error}"))?;
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("PowerShell 未返回 Profile 路径".into());
+    }
+    Ok(PathBuf::from(path))
+}
+
+#[cfg(not(windows))]
+fn powershell_profile_path() -> Result<PathBuf, String> {
+    Err("PowerShell 集成仅支持 Windows".into())
 }
 
 const FISH_SHELL_INIT: &str = r#"function qn
@@ -361,6 +407,130 @@ const ZSH_SHELL_INIT: &str = r#"qn() {
     return "$qn_status"
 }
 "#;
+
+const POWERSHELL_SHELL_INIT: &str = r#"function qn {
+    $env:QN_SHELL_INTEGRATION = "1"
+    $qn_binary = (Get-Command qn -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path
+    $qn_original = @($args)
+    $qn_passthrough = @("-h", "--help", "-t", "--text", "-m", "--markdown", "-i", "--image", "-f", "--file", "--status", "init", "init-shell", "__notify", "__is-configured")
+
+    if ($qn_original.Count -gt 0 -and $qn_original[0] -in $qn_passthrough) {
+        & $qn_binary @qn_original
+        return
+    }
+
+    $qn_args = [System.Collections.Generic.List[string]]::new()
+    foreach ($qn_argument in $qn_original) {
+        [void]$qn_args.Add([string]$qn_argument)
+    }
+    $qn_notify = $true
+    $qn_attach = $false
+    $qn_has_shell_script = $false
+    $qn_shell_script = $null
+
+    while ($qn_args.Count -gt 0) {
+        $qn_argument = $qn_args[0]
+        if ($qn_argument -eq "--no-notify") {
+            $qn_notify = $false
+            $qn_args.RemoveAt(0)
+        } elseif ($qn_argument -eq "-a" -or $qn_argument -eq "--attach-output") {
+            $qn_attach = $true
+            $qn_args.RemoveAt(0)
+        } elseif ($qn_argument -eq "--shell") {
+            if ($qn_args.Count -ne 2) {
+                & $qn_binary @qn_original
+                return
+            }
+            $qn_has_shell_script = $true
+            $qn_shell_script = $qn_args[1]
+            $qn_args.Clear()
+        } elseif ($qn_argument -eq "--") {
+            $qn_args.RemoveAt(0)
+            break
+        } elseif ($qn_argument.StartsWith("-")) {
+            & $qn_binary @qn_original
+            return
+        } else {
+            break
+        }
+    }
+
+    if (-not $qn_has_shell_script -and $qn_args.Count -eq 0) {
+        & $qn_binary @qn_original
+        return
+    }
+
+    if ($qn_notify -and -not $script:__qn_config_checked) {
+        $script:__qn_config_checked = $true
+        & $qn_binary __is-configured
+        if ($LASTEXITCODE -ne 0) {
+            [Console]::Error.WriteLine("提示：qn 尚未初始化；运行 qn init 完成通知配置。本次命令会照常执行，但不会发送通知。")
+        }
+    }
+
+    $qn_started = Get-Date
+    if ($qn_has_shell_script) {
+        $qn_display = "shell: $qn_shell_script"
+    } else {
+        $qn_display = [string]::Join(" ", [string[]]$qn_args.ToArray())
+    }
+
+    $qn_tempdir = $null
+    $qn_stdout = $null
+    $qn_stderr = $null
+    $global:LASTEXITCODE = 0
+    if ($qn_attach) {
+        $qn_tempdir = Join-Path ([System.IO.Path]::GetTempPath()) ("qn-" + [guid]::NewGuid().ToString("N"))
+        [System.IO.Directory]::CreateDirectory($qn_tempdir) | Out-Null
+        $qn_stdout = Join-Path $qn_tempdir "stdout"
+        $qn_stderr = Join-Path $qn_tempdir "stderr"
+        if ($qn_has_shell_script) {
+            Invoke-Expression $qn_shell_script 1> $qn_stdout 2> $qn_stderr
+        } else {
+            $qn_command = $qn_args[0]
+            $qn_command_args = if ($qn_args.Count -gt 1) { $qn_args.GetRange(1, $qn_args.Count - 1).ToArray() } else { @() }
+            & $qn_command @qn_command_args 1> $qn_stdout 2> $qn_stderr
+        }
+        $qn_success = $?
+        $qn_stdout_content = Get-Content -LiteralPath $qn_stdout -Raw -ErrorAction Ignore
+        if ($null -ne $qn_stdout_content) {
+            Write-Host -NoNewline $qn_stdout_content
+        }
+        $qn_stderr_content = Get-Content -LiteralPath $qn_stderr -Raw -ErrorAction Ignore
+        if ($null -ne $qn_stderr_content) {
+            [Console]::Error.Write($qn_stderr_content)
+        }
+    } elseif ($qn_has_shell_script) {
+        Invoke-Expression $qn_shell_script
+        $qn_success = $?
+    } else {
+        $qn_command = $qn_args[0]
+        $qn_command_args = if ($qn_args.Count -gt 1) { $qn_args.GetRange(1, $qn_args.Count - 1).ToArray() } else { @() }
+        & $qn_command @qn_command_args
+        $qn_success = $?
+    }
+
+    if ($qn_success) {
+        $qn_status = 0
+    } elseif ($LASTEXITCODE -ne 0) {
+        $qn_status = [int]$LASTEXITCODE
+    } else {
+        $qn_status = 1
+    }
+    $qn_elapsed = [math]::Floor(((Get-Date) - $qn_started).TotalSeconds)
+    if ($qn_notify) {
+        $qn_report = @("__notify", "--command", $qn_display, "--exit-code", "$qn_status", "--elapsed", "$qn_elapsed")
+        if ($qn_attach) {
+            $qn_report += @("--stdout-file", $qn_stdout, "--stderr-file", $qn_stderr)
+        }
+        & $qn_binary @qn_report | Out-Null
+    }
+    if ($qn_attach) {
+        Remove-Item -LiteralPath $qn_tempdir -Recurse -Force
+    }
+    $global:LASTEXITCODE = $qn_status
+}
+"#;
 #[derive(Debug)]
 enum Invocation {
     Run(Options),
@@ -505,7 +675,12 @@ fn shell_from_ancestor_processes() -> Option<ShellKind> {
     None
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn shell_from_ancestor_processes() -> Option<ShellKind> {
+    env::var_os("PSModulePath").map(|_| ShellKind::PowerShell)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn shell_from_ancestor_processes() -> Option<ShellKind> {
     None
 }
@@ -518,6 +693,12 @@ fn warn_missing_shell_integration() {
             shell.install_command()
         );
     } else {
+        #[cfg(windows)]
+        eprintln!(
+            "提示：当前 PowerShell 未加载 qn 集成；运行 `{}` 会将集成写入启动配置。",
+            ShellKind::PowerShell.install_command()
+        );
+        #[cfg(not(windows))]
         eprintln!(
             "提示：当前 Shell 未加载 qn 集成。运行其一以写入启动配置：\n  Fish: {}\n  Bash: {}\n  Zsh:  {}",
             ShellKind::Fish.install_command(),
@@ -594,10 +775,10 @@ fn write_shell_integration(path: &Path, shell: ShellKind) -> Result<bool, String
 }
 
 fn install_shell_integration(shell_name: &str) -> Result<String, String> {
-    let shell = ShellKind::from_name(shell_name)
-        .ok_or_else(|| format!("不支持的 Shell：{shell_name}；请使用 fish、bash 或 zsh"))?;
-    let home = env::var_os("HOME").ok_or("无法确定用户目录，请设置 HOME")?;
-    let path = shell.startup_config_path(&PathBuf::from(home));
+    let shell = ShellKind::from_name(shell_name).ok_or_else(|| {
+        format!("不支持的 Shell：{shell_name}；请使用 fish、bash、zsh 或 powershell")
+    })?;
+    let path = shell.startup_config_path()?;
     let updated = write_shell_integration(&path, shell)?;
     let state = if updated {
         "已写入"
@@ -772,9 +953,15 @@ fn initialize_config_with_io(
         "要让 qn 使用当前 Shell 的 alias 和 function，请运行对应命令写入启动配置："
     )
     .map_err(|error| error.to_string())?;
-    writeln!(output, "  fish: qn init-shell fish").map_err(|error| error.to_string())?;
-    writeln!(output, "  bash: qn init-shell bash").map_err(|error| error.to_string())?;
-    writeln!(output, "  zsh:  qn init-shell zsh").map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    writeln!(output, "  powershell: qn init-shell powershell")
+        .map_err(|error| error.to_string())?;
+    #[cfg(not(windows))]
+    {
+        writeln!(output, "  fish: qn init-shell fish").map_err(|error| error.to_string())?;
+        writeln!(output, "  bash: qn init-shell bash").map_err(|error| error.to_string())?;
+        writeln!(output, "  zsh:  qn init-shell zsh").map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -823,7 +1010,7 @@ fn print_usage() {
     eprintln!("  qn -f|--file <path>");
     eprintln!("  qn --status");
     eprintln!("  qn init");
-    eprintln!("  qn init-shell <fish|bash|zsh>");
+    eprintln!("  qn init-shell <fish|bash|zsh|powershell>");
     eprintln!();
     eprintln!("选项:");
     eprintln!("  -a, --attach-output  在通知中附带命令的标准输出和标准错误");
@@ -1400,6 +1587,18 @@ fn format_duration(seconds: u64) -> String {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_file_path(kind: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "qn-{kind}-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
     #[test]
     fn parses_attach_output_before_command() {
         let invocation =
@@ -1584,14 +1783,7 @@ mod tests {
 
     #[test]
     fn initializes_config_from_standard_io() {
-        let path = env::temp_dir().join(format!(
-            "qn-init-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time should be after Unix epoch")
-                .as_nanos()
-        ));
+        let path = temporary_file_path("init-test");
         let mut input = io::Cursor::new(b"\ntoken-value\n\n");
         let mut output = Vec::new();
 
@@ -1614,33 +1806,24 @@ mod tests {
 
     #[test]
     fn missing_device_name_uses_hostname_and_persists_it() {
-        let path = env::temp_dir().join(format!(
-            "qn-config-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time should be after Unix epoch")
-                .as_nanos()
-        ));
+        let path = temporary_file_path("config-test");
         let expected = default_device_name().expect("hostname should be available");
 
         let name = device_name_from_config(&path).expect("device name should be saved");
 
         assert_eq!(name, expected);
-        assert_eq!(read_config_value_from(&path, "name"), Some(expected));
+        assert_eq!(
+            read_config_value_from(&path, "name"),
+            Some(expected),
+            "configuration contents: {:?}",
+            fs::read_to_string(&path)
+        );
         fs::remove_file(path).expect("temporary config should be removed");
     }
 
     #[test]
     fn configured_device_name_is_used() {
-        let path = env::temp_dir().join(format!(
-            "qn-config-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time should be after Unix epoch")
-                .as_nanos()
-        ));
+        let path = temporary_file_path("config-test");
         fs::write(&path, "name=办公室 Mac\n").expect("temporary config should be written");
 
         let name = device_name_from_config(&path).expect("configured name should be read");
@@ -1737,7 +1920,12 @@ mod tests {
 
     #[test]
     fn provides_shell_integrations_for_supported_shells() {
-        for shell in [ShellKind::Fish, ShellKind::Bash, ShellKind::Zsh] {
+        for shell in [
+            ShellKind::Fish,
+            ShellKind::Bash,
+            ShellKind::Zsh,
+            ShellKind::PowerShell,
+        ] {
             let integration = shell.init_script();
             assert!(integration.contains("function qn") || integration.contains("qn()"));
             assert!(integration.contains("__notify"));
@@ -1749,6 +1937,12 @@ mod tests {
                 );
             }
         }
+        assert!(POWERSHELL_SHELL_INIT.contains("Get-Command qn -CommandType Application"));
+        assert!(POWERSHELL_SHELL_INIT.contains("Invoke-Expression"));
+        assert_eq!(
+            ShellKind::from_name("powershell"),
+            Some(ShellKind::PowerShell)
+        );
         assert!(ShellKind::from_name("sh").is_none());
     }
 }
