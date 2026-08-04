@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
+use directories::ProjectDirs;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
@@ -427,8 +428,9 @@ struct StatusResponse {
 }
 
 fn config_path() -> Result<PathBuf, String> {
-    let home = env::var_os("HOME").ok_or("无法确定用户目录，请设置 HOME")?;
-    Ok(PathBuf::from(home).join(".config/qn/config"))
+    let project_dirs =
+        ProjectDirs::from("cn", "krust", "qn").ok_or("无法确定当前用户的配置目录")?;
+    Ok(project_dirs.config_dir().join("config"))
 }
 
 fn read_config_value_from(path: &Path, name: &str) -> Option<String> {
@@ -1533,6 +1535,16 @@ mod tests {
             select_default_device_name("build-server".into(), Some("MacBook-Pro".into())),
             Ok("build-server".into())
         );
+    }
+
+    #[test]
+    fn uses_platform_native_project_config_directory() {
+        let expected = ProjectDirs::from("cn", "krust", "qn")
+            .expect("current platform should provide a configuration directory")
+            .config_dir()
+            .join("config");
+
+        assert_eq!(config_path(), Ok(expected));
     }
 
     #[test]

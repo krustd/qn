@@ -70,11 +70,13 @@ For ordinary command arguments, the executable starts the requested program dire
 
 ## Configuration
 
-`qn init` requires an interactive terminal and writes this file:
+`qn init` requires an interactive terminal and writes the configuration file to the platform-native user configuration directory:
 
-```text
-~/.config/qn/config
-```
+| Platform | Path |
+|----------|------|
+| Linux and other Unix systems | `$XDG_CONFIG_HOME/qn/config`, or `~/.config/qn/config` when `XDG_CONFIG_HOME` is unset |
+| macOS | `~/Library/Application Support/cn.krust.qn/config` |
+| Windows | `%APPDATA%\krust\qn\config` |
 
 It obtains values in this order:
 
