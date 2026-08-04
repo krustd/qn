@@ -1388,6 +1388,7 @@ fn decode_with_encoding(bytes: &[u8], encoding: &'static Encoding) -> String {
     text.into_owned()
 }
 
+#[cfg(any(windows, test))]
 fn decode_windows_code_page(bytes: &[u8], code_page: u16) -> Option<String> {
     let encoding = codepage::to_encoding(code_page)?;
     let (text, _, had_errors) = encoding.decode(bytes);
