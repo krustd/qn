@@ -210,6 +210,12 @@ const FISH_SHELL_INIT: &str = r#"function qn
         end
         set qn_stdout "$qn_tempdir/stdout"
         set qn_stderr "$qn_tempdir/stderr"
+        touch "$qn_stdout" "$qn_stderr"
+        or begin
+            printf '%s\n' '错误：无法创建 qn 输出临时文件。' >&2
+            command rm -rf -- "$qn_tempdir"
+            return 1
+        end
         if test $qn_has_shell_script -eq 1
             eval $qn_shell_script >"$qn_stdout" 2>"$qn_stderr"
         else
@@ -1242,6 +1248,17 @@ fn parse_shell_report(args: impl IntoIterator<Item = String>) -> Result<ShellRep
     })
 }
 
+fn read_captured_output_file(path: &Path, output_name: &str) -> Result<Vec<u8>, String> {
+    match fs::read(path) {
+        Ok(output) => Ok(output),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!(
+            "读取{output_name}失败（{}）: {error}",
+            path.display()
+        )),
+    }
+}
+
 fn notify_shell_report(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let report = parse_shell_report(args)?;
     if !is_configured() {
@@ -1249,12 +1266,8 @@ fn notify_shell_report(args: impl IntoIterator<Item = String>) -> Result<(), Str
     }
     let output = match (report.stdout_file, report.stderr_file) {
         (Some(stdout_file), Some(stderr_file)) => {
-            let stdout = fs::read(&stdout_file).map_err(|error| {
-                format!("读取标准输出失败（{}）: {error}", stdout_file.display())
-            })?;
-            let stderr = fs::read(&stderr_file).map_err(|error| {
-                format!("读取标准错误失败（{}）: {error}", stderr_file.display())
-            })?;
+            let stdout = read_captured_output_file(&stdout_file, "标准输出")?;
+            let stderr = read_captured_output_file(&stderr_file, "标准错误")?;
             Some(command_output_display_bytes(&stdout, &stderr))
         }
         (None, None) => None,
@@ -2034,6 +2047,16 @@ mod tests {
     }
 
     #[test]
+    fn treats_missing_captured_output_as_empty() {
+        let path = temporary_file_path("missing-output");
+
+        let output =
+            read_captured_output_file(&path, "标准输出").expect("missing output should be empty");
+
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn writes_shell_integration_once_and_migrates_legacy_loader() {
         let path = env::temp_dir().join(format!(
             "qn-shell-integration-test-{}-{}",
@@ -2123,6 +2146,7 @@ mod tests {
                 );
             }
         }
+        assert!(FISH_SHELL_INIT.contains("touch \"$qn_stdout\" \"$qn_stderr\""));
         assert!(POWERSHELL_SHELL_INIT.contains("Get-Command qn -CommandType Application"));
         assert!(POWERSHELL_SHELL_INIT.contains("Invoke-Expression"));
         assert!(POWERSHELL_SHELL_INIT.contains("$qn_args.ToArray() -join \" \""));
