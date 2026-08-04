@@ -566,6 +566,12 @@ struct ShellReport {
     stderr_file: Option<PathBuf>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CommandNotification {
+    markdown: String,
+    output_attachment: Option<String>,
+}
+
 #[derive(Serialize)]
 struct Notification<'a> {
     summary: &'a str,
@@ -1254,12 +1260,7 @@ fn notify_shell_report(args: impl IntoIterator<Item = String>) -> Result<(), Str
         (None, None) => None,
         _ => unreachable!("parse_shell_report ensures output files are paired"),
     };
-    notify(&build_summary_for_command(
-        &report.command,
-        report.code,
-        report.elapsed_seconds,
-        output.as_deref(),
-    ))
+    notify_command_report(&report.command, report.code, report.elapsed_seconds, output)
 }
 
 fn run(options: &Options) -> Result<CommandResult, String> {
@@ -1343,42 +1344,118 @@ fn command_output_display_bytes(stdout: &[u8], stderr: &[u8]) -> String {
     }
 }
 
-fn build_summary(
-    options: &Options,
-    code: i32,
-    elapsed_seconds: u64,
-    output: Option<&std::process::Output>,
-) -> String {
-    let output = output.map(command_output_display);
-    build_summary_for_command(
-        &command_display(options),
-        code,
-        elapsed_seconds,
-        output.as_deref(),
-    )
+const MAX_DEVICE_NAME_CHARS: usize = 64;
+const MAX_WORKING_DIRECTORY_CHARS: usize = 256;
+const MAX_COMMAND_CHARS: usize = 320;
+const MAX_INLINE_OUTPUT_CHARS: usize = 1_000;
+const MAX_MARKDOWN_CONTENT_CHARS: usize = 4_000;
+
+fn truncate_text(value: &str, maximum_characters: usize, suffix: &str) -> (String, bool) {
+    if value.chars().count() <= maximum_characters {
+        return (value.to_owned(), false);
+    }
+    let prefix_length = maximum_characters.saturating_sub(suffix.chars().count());
+    let prefix: String = value.chars().take(prefix_length).collect();
+    (format!("{prefix}{suffix}"), true)
 }
 
-fn build_summary_for_command(
+fn markdown_text(value: &str, maximum_characters: usize) -> String {
+    let (value, _) = truncate_text(value, maximum_characters, "…");
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.replace(['\r', '\n'], " ").chars() {
+        if matches!(
+            character,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '#' | '+' | '-' | '|'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+fn markdown_code_block(language: &str, content: &str) -> String {
+    let mut longest_backtick_run = 0;
+    let mut current_backtick_run = 0;
+    for character in content.chars() {
+        if character == '`' {
+            current_backtick_run += 1;
+            longest_backtick_run = longest_backtick_run.max(current_backtick_run);
+        } else {
+            current_backtick_run = 0;
+        }
+    }
+    let fence = "`".repeat(longest_backtick_run.max(3) + 1);
+    format!("\n{fence}{language}\n{content}\n{fence}")
+}
+
+fn build_markdown_notification(
+    device_name: &str,
     command: &str,
     code: i32,
     elapsed_seconds: u64,
-    output: Option<&str>,
-) -> String {
+    working_directory: &str,
+    output: Option<String>,
+) -> CommandNotification {
     let state = if code == 0 {
         "任务完成"
     } else {
         "任务失败"
     };
-    let mut summary = format!(
-        "{state}\n命令：{command}\n退出码：{code}\n耗时：{}\n工作目录：{}",
+    let device_name = markdown_text(device_name, MAX_DEVICE_NAME_CHARS);
+    let working_directory = markdown_text(working_directory, MAX_WORKING_DIRECTORY_CHARS);
+    let (command, _) = truncate_text(command, MAX_COMMAND_CHARS, "…（已截断）");
+    let mut markdown = format!(
+        "## {state}\n\n**设备**：{device_name}\n\n**耗时**：{} · **退出码**：{code}\n\n**工作目录**：{working_directory}\n\n### 命令{}",
         format_duration(elapsed_seconds),
-        env::current_dir().map_or_else(|_| "未知".into(), |path| path.display().to_string())
+        markdown_code_block("sh", &command),
     );
-    if let Some(output) = output {
-        summary.push_str("\n输出：\n");
-        summary.push_str(output);
+    let output_attachment = output.and_then(|output| {
+        if output == "（无输出）" {
+            markdown.push_str("\n\n### 输出\n（无输出）");
+            return None;
+        }
+        let (preview, was_truncated) = truncate_text(
+            &output,
+            MAX_INLINE_OUTPUT_CHARS,
+            "\n…（已截断，完整输出见附件）",
+        );
+        if was_truncated {
+            markdown.push_str("\n\n### 输出（已截断，完整日志作为附件发送）");
+        } else {
+            markdown.push_str("\n\n### 输出");
+        }
+        markdown.push_str(&markdown_code_block("text", &preview));
+        was_truncated.then_some(output)
+    });
+    debug_assert!(markdown.chars().count() <= MAX_MARKDOWN_CONTENT_CHARS);
+    CommandNotification {
+        markdown,
+        output_attachment,
     }
-    summary
+}
+
+fn notify_command_report(
+    command: &str,
+    code: i32,
+    elapsed_seconds: u64,
+    output: Option<String>,
+) -> Result<(), String> {
+    let working_directory =
+        env::current_dir().map_or_else(|_| "未知".into(), |path| path.display().to_string());
+    let notification = build_markdown_notification(
+        &device_name()?,
+        command,
+        code,
+        elapsed_seconds,
+        &working_directory,
+        output,
+    );
+    notify_markdown(&notification.markdown)?;
+    if let Some(output) = notification.output_attachment {
+        send_output_attachment(output)?;
+    }
+    Ok(())
 }
 
 fn notification_summary(device_name: &str, summary: &str) -> String {
@@ -1444,6 +1521,19 @@ fn send_media(path: &Path, media_type: MediaType) -> Result<(), String> {
     let file = fs::File::open(path)
         .map_err(|error| format!("读取文件失败（{}）: {error}", path.display()))?;
     let part = reqwest::blocking::multipart::Part::reader(file).file_name(file_name.to_owned());
+    send_media_part(part, media_type)
+}
+
+fn send_output_attachment(output: String) -> Result<(), String> {
+    let part = reqwest::blocking::multipart::Part::bytes(output.into_bytes())
+        .file_name("qn-output.txt".to_owned());
+    send_media_part(part, MediaType::File)
+}
+
+fn send_media_part(
+    part: reqwest::blocking::multipart::Part,
+    media_type: MediaType,
+) -> Result<(), String> {
     let form = reqwest::blocking::multipart::Form::new()
         .part("file", part)
         .text("file_type", media_type.api_value().to_owned());
@@ -1584,17 +1674,18 @@ fn main() -> ExitCode {
             127
         }
     };
-    let summary = build_summary(
-        &options,
-        code,
-        started.elapsed().as_secs(),
-        result
-            .as_ref()
-            .ok()
-            .and_then(|result| result.output.as_ref()),
-    );
+    let output = result
+        .as_ref()
+        .ok()
+        .and_then(|result| result.output.as_ref())
+        .map(command_output_display);
     if options.notify && is_configured() {
-        if let Err(error) = notify(&summary) {
+        if let Err(error) = notify_command_report(
+            &command_display(&options),
+            code,
+            started.elapsed().as_secs(),
+            output,
+        ) {
             eprintln!("警告: {error}");
         }
     }
@@ -1758,7 +1849,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn attaches_standard_output_and_error_to_summary() {
+    fn attaches_standard_output_and_error_to_markdown_notification() {
         let options = Options {
             command: vec![
                 "sh".into(),
@@ -1772,9 +1863,38 @@ mod tests {
         let result = run(&options).expect("command should run");
 
         assert_eq!(result.code, 0);
-        let summary = build_summary(&options, result.code, 0, result.output.as_ref());
-        assert!(summary.contains("标准输出：\noutput"));
-        assert!(summary.contains("标准错误：\nerror"));
+        let notification = build_markdown_notification(
+            "MacBook-Pro",
+            &command_display(&options),
+            result.code,
+            0,
+            "/workspace/qn",
+            result.output.as_ref().map(command_output_display),
+        );
+        assert!(notification.markdown.starts_with("## 任务完成"));
+        assert!(notification.markdown.contains("**设备**：MacBook\\-Pro"));
+        assert!(notification.markdown.contains("### 输出\n````text"));
+        assert!(notification.markdown.contains("标准输出：\noutput"));
+        assert!(notification.markdown.contains("标准错误：\nerror"));
+        assert_eq!(notification.output_attachment, None);
+    }
+
+    #[test]
+    fn truncates_long_output_and_keeps_full_log_as_attachment() {
+        let output = "x".repeat(MAX_INLINE_OUTPUT_CHARS + 1);
+        let notification = build_markdown_notification(
+            "MacBook-Pro",
+            "echo output",
+            0,
+            0,
+            "/workspace/qn",
+            Some(output.clone()),
+        );
+
+        assert!(notification.markdown.contains("完整日志作为附件发送"));
+        assert!(notification.markdown.contains("完整输出见附件"));
+        assert_eq!(notification.output_attachment, Some(output));
+        assert!(notification.markdown.chars().count() <= MAX_MARKDOWN_CONTENT_CHARS);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Run a command and send its completion result to an HTTP endpoint.
 
-`qn` reports the command, exit code, elapsed time, working directory, and—when requested—its standard output and standard error. It sends a notification for every wrapped command, including commands that finish immediately; it does not apply a duration threshold. Notification failures are written to standard error and do not change the command's exit status.
+`qn` sends each wrapped command as a structured Markdown completion card containing the device name, command, exit code, elapsed time, and working directory. With `--attach-output`, standard output and standard error appear in a fenced code block. Output previews are limited to 1,000 characters; longer output is also sent as a `qn-output.txt` attachment. It sends a notification for every wrapped command, including commands that finish immediately; it does not apply a duration threshold. Notification failures are written to standard error and do not change the command's exit status.
 
 ## Installation
 
@@ -48,7 +48,7 @@ qn init-shell <fish|bash|zsh|powershell>
 
 | Option | Behavior |
 |--------|----------|
-| `-a`, `--attach-output` | Capture standard output and standard error, replay them after the command exits, and add them to the notification. Output is therefore not streamed live while the command runs. |
+| `-a`, `--attach-output` | Capture standard output and standard error, replay them after the command exits, and show them in the Markdown completion card. Output is therefore not streamed live while the command runs. Previews longer than 1,000 characters are truncated and sent in full as a `qn-output.txt` attachment. |
 | `--no-notify` | Run the command without checking configuration or sending a notification. |
 | `-t <content>`, `--text <content>` | Send a plain-text message without running a command. The device name is prefixed to the content. |
 | `-m <content>`, `--markdown <content>` | Send Markdown without rewriting its content. |
@@ -124,25 +124,25 @@ After upgrading, run `qn init-shell <shell>` once for the current shell to updat
 
 ## Notification requests
 
-qn sends wrapped commands and `qn -t` to `POST /v1/messages` under `QN_ENDPOINT`:
+qn sends wrapped commands as Markdown to `POST /v1/markdown` under `QN_ENDPOINT`:
 
-```http
+`````http
 Authorization: Bearer <token>
 Content-Type: application/json
 
-{"summary":"device-name\n任务完成\n命令：make -j12\n退出码：0\n耗时：2m 15s\n工作目录：/home/me/project"}
-```
+{"content":"## 任务完成\n\n**设备**：build-server\n\n**耗时**：2m 15s · **退出码**：0\n\n**工作目录**：/home/me/project\n\n### 命令\n````sh\nmake -j12\n````"}
+`````
 
-A nonzero command exit code changes `任务完成` to `任务失败`. With `--attach-output`, the summary also includes an `输出：` section containing the captured standard output and/or standard error.
+A nonzero command exit code changes `任务完成` to `任务失败`. With `--attach-output`, captured standard output and/or standard error are rendered in a fenced `text` block. If the preview exceeds 1,000 characters, qn sends its complete contents as a `qn-output.txt` file attachment after the completion card.
 
 All native routes use the same server root:
 
 | Action | Request |
 |--------|---------|
-| Wrapped command, `qn -t ...` | `POST /v1/messages` |
+| Wrapped command | `POST /v1/markdown` with the generated completion card |
+| `qn -t ...` | `POST /v1/messages` with a plain-text message |
 | `qn -m ...` | `POST /v1/markdown` with verbatim `content` |
-| `qn -i ...` | `POST /v1/media` multipart form with `file_type=image` |
-| `qn -f ...` | `POST /v1/media` multipart form with `file_type=file` |
+| `qn -i ...` / `qn -f ...` | `POST /v1/media` multipart form with `file_type=image` / `file` |
 | `qn --status` | `GET /status` |
 
 [QQ Task Notifier](https://github.com/krustd/qq-task-notifier) binds exactly one default recipient; qn does not allow callers to override it.
@@ -150,9 +150,9 @@ All native routes use the same server root:
 ## How it works
 
 1. For a command invocation, `qn` runs the requested command and records its exit code and elapsed time.
-2. Direct actions submit their requested text, Markdown, image, file, or status operation immediately.
-3. Wrapped commands and plain text add the configured device name; Markdown content is sent unchanged.
-4. A command-notification transport error or non-success HTTP status is reported as a warning; the wrapped command's exit code is retained. Direct-action delivery errors exit with status `1`.
+2. Wrapped commands are rendered as Markdown completion cards; plain text adds the configured device name, while explicit Markdown content is sent unchanged.
+3. With `--attach-output`, qn replays the captured output locally and adds a bounded preview to the card; long output is uploaded as a file attachment.
+4. Direct actions submit their requested text, Markdown, image, file, or status operation immediately. A command-notification transport error or non-success HTTP status is reported as a warning; the wrapped command's exit code is retained. Direct-action delivery errors exit with status `1`.
 
 ## License
 
