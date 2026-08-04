@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
-use directories::ProjectDirs;
+use directories::BaseDirs;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
@@ -428,9 +428,8 @@ struct StatusResponse {
 }
 
 fn config_path() -> Result<PathBuf, String> {
-    let project_dirs =
-        ProjectDirs::from("cn", "krust", "qn").ok_or("无法确定当前用户的配置目录")?;
-    Ok(project_dirs.config_dir().join("config"))
+    let base_dirs = BaseDirs::new().ok_or("无法确定当前用户的配置目录")?;
+    Ok(base_dirs.config_dir().join("qn").join("config"))
 }
 
 fn read_config_value_from(path: &Path, name: &str) -> Option<String> {
@@ -1538,10 +1537,11 @@ mod tests {
     }
 
     #[test]
-    fn uses_platform_native_project_config_directory() {
-        let expected = ProjectDirs::from("cn", "krust", "qn")
+    fn uses_platform_native_config_directory() {
+        let expected = BaseDirs::new()
             .expect("current platform should provide a configuration directory")
             .config_dir()
+            .join("qn")
             .join("config");
 
         assert_eq!(config_path(), Ok(expected));

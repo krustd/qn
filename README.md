@@ -75,8 +75,8 @@ For ordinary command arguments, the executable starts the requested program dire
 | Platform | Path |
 |----------|------|
 | Linux and other Unix systems | `$XDG_CONFIG_HOME/qn/config`, or `~/.config/qn/config` when `XDG_CONFIG_HOME` is unset |
-| macOS | `~/Library/Application Support/cn.krust.qn/config` |
-| Windows | `%APPDATA%\krust\qn\config` |
+| macOS | `~/Library/Application Support/qn/config` |
+| Windows | `%APPDATA%\qn\config` |
 
 It obtains values in this order:
 
