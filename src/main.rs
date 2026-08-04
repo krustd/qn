@@ -707,20 +707,16 @@ fn device_name() -> Result<String, String> {
     device_name_from_config(&config_path()?)
 }
 
-fn initialize_config() -> Result<(), String> {
-    let path = config_path()?;
-    let tty = fs::File::options()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|_| {
-            "配置需要交互式终端，请设置 QN_ENDPOINT 和 QN_TOKEN 环境变量后重试".to_owned()
-        })?;
-    let mut input = io::BufReader::new(tty.try_clone().map_err(|error| error.to_string())?);
-    let mut output = tty;
-    let endpoint = match env::var("QN_ENDPOINT") {
-        Ok(e) => e,
-        Err(_) => {
+fn initialize_config_with_io(
+    path: &Path,
+    endpoint: Option<String>,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    device_name: impl FnOnce() -> Result<String, String>,
+) -> Result<(), String> {
+    let endpoint = match endpoint {
+        Some(endpoint) => endpoint,
+        None => {
             writeln!(output, "请输入 QN_ENDPOINT（默认 {DEFAULT_ENDPOINT}）：")
                 .map_err(|error| error.to_string())?;
             output.flush().map_err(|error| error.to_string())?;
@@ -746,7 +742,7 @@ fn initialize_config() -> Result<(), String> {
     if token.is_empty() {
         return Err("QN_TOKEN 不能为空".into());
     }
-    let default_name = default_device_name()?;
+    let default_name = device_name()?;
     writeln!(output, "请输入设备名称（默认 {default_name}）：")
         .map_err(|error| error.to_string())?;
     output.flush().map_err(|error| error.to_string())?;
@@ -763,19 +759,58 @@ fn initialize_config() -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let config = format!("endpoint={endpoint}\ntoken={token}\nname={name}\n");
-    fs::write(&path, config).map_err(|error| format!("写入配置失败: {error}"))?;
+    fs::write(path, config).map_err(|error| format!("写入配置失败: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|error| error.to_string())?;
     }
-    println!("配置已保存：{}", path.display());
-    println!("要让 qn 使用当前 Shell 的 alias 和 function，请运行对应命令写入启动配置：");
-    println!("  fish: qn init-shell fish");
-    println!("  bash: qn init-shell bash");
-    println!("  zsh:  qn init-shell zsh");
+    writeln!(output, "配置已保存：{}", path.display()).map_err(|error| error.to_string())?;
+    writeln!(
+        output,
+        "要让 qn 使用当前 Shell 的 alias 和 function，请运行对应命令写入启动配置："
+    )
+    .map_err(|error| error.to_string())?;
+    writeln!(output, "  fish: qn init-shell fish").map_err(|error| error.to_string())?;
+    writeln!(output, "  bash: qn init-shell bash").map_err(|error| error.to_string())?;
+    writeln!(output, "  zsh:  qn init-shell zsh").map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn initialize_config() -> Result<(), String> {
+    let path = config_path()?;
+    let tty = fs::File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|_| "配置需要交互式终端；请在终端中运行 `qn init`".to_owned())?;
+    let mut input = io::BufReader::new(tty.try_clone().map_err(|error| error.to_string())?);
+    let mut output = tty;
+    initialize_config_with_io(
+        &path,
+        env::var("QN_ENDPOINT").ok(),
+        &mut input,
+        &mut output,
+        default_device_name,
+    )
+}
+
+#[cfg(not(unix))]
+fn initialize_config() -> Result<(), String> {
+    let path = config_path()?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    initialize_config_with_io(
+        &path,
+        env::var("QN_ENDPOINT").ok(),
+        &mut input,
+        &mut output,
+        default_device_name,
+    )
 }
 
 fn print_usage() {
@@ -1545,6 +1580,36 @@ mod tests {
             .join("config");
 
         assert_eq!(config_path(), Ok(expected));
+    }
+
+    #[test]
+    fn initializes_config_from_standard_io() {
+        let path = env::temp_dir().join(format!(
+            "qn-init-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after Unix epoch")
+                .as_nanos()
+        ));
+        let mut input = io::Cursor::new(b"\ntoken-value\n\n");
+        let mut output = Vec::new();
+
+        initialize_config_with_io(&path, None, &mut input, &mut output, || {
+            Ok("test-host".into())
+        })
+        .expect("configuration should initialize");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("configuration should be readable"),
+            format!("endpoint={DEFAULT_ENDPOINT}\ntoken=token-value\nname=test-host\n")
+        );
+        assert!(
+            String::from_utf8(output)
+                .expect("prompts should be UTF-8")
+                .contains("配置已保存")
+        );
+        fs::remove_file(path).expect("temporary config should be removed");
     }
 
     #[test]

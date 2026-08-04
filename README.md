@@ -78,6 +78,8 @@ For ordinary command arguments, the executable starts the requested program dire
 | macOS | `~/Library/Application Support/qn/config` |
 | Windows | `%APPDATA%\qn\config` |
 
+On Windows, `qn init` prompts through standard input and output; it does not require a `HOME` environment variable.
+
 It obtains values in this order:
 
 1. `QN_ENDPOINT` — the QQ Task Notifier server root URL. If unset, `qn init` prompts for it; press Enter to use `https://krust.iepose.cn`.
