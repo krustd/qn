@@ -472,7 +472,7 @@ const POWERSHELL_SHELL_INIT: &str = r#"function qn {
     if ($qn_has_shell_script) {
         $qn_display = "shell: $qn_shell_script"
     } else {
-        $qn_display = [string]::Join(" ", [string[]]$qn_args.ToArray())
+        $qn_display = $qn_args.ToArray() -join " "
     }
 
     $qn_tempdir = $null
@@ -1918,6 +1918,31 @@ mod tests {
         fs::remove_file(path).expect("temporary config should be removed");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn powershell_shell_initialization_parses() {
+        let path = temporary_file_path("powershell-script");
+        fs::write(&path, POWERSHELL_SHELL_INIT).expect("PowerShell script should be written");
+        let escaped_path = path.to_string_lossy().replace('\'', "''");
+        let command = format!("& {{ . '{escaped_path}' }}");
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command.as_str(),
+            ])
+            .output()
+            .expect("PowerShell should be available on Windows");
+
+        assert!(
+            output.status.success(),
+            "PowerShell parser failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_file(path).expect("temporary PowerShell script should be removed");
+    }
+
     #[test]
     fn provides_shell_integrations_for_supported_shells() {
         for shell in [
@@ -1939,6 +1964,8 @@ mod tests {
         }
         assert!(POWERSHELL_SHELL_INIT.contains("Get-Command qn -CommandType Application"));
         assert!(POWERSHELL_SHELL_INIT.contains("Invoke-Expression"));
+        assert!(POWERSHELL_SHELL_INIT.contains("$qn_args.ToArray() -join \" \""));
+        assert!(!POWERSHELL_SHELL_INIT.contains("[string[]]$qn_args.ToArray()"));
         assert_eq!(
             ShellKind::from_name("powershell"),
             Some(ShellKind::PowerShell)

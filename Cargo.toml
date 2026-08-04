@@ -1,6 +1,6 @@
 [package]
 name = "krust-qn"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "Shell-aware command completion notifications"
 license = "MIT OR Apache-2.0"
