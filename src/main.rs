@@ -711,8 +711,36 @@ fn warn_missing_shell_integration() {
 const SHELL_INTEGRATION_BEGIN_MARKER: &str = "# >>> qn shell integration >>>";
 const SHELL_INTEGRATION_END_MARKER: &str = "# <<< qn shell integration <<<";
 
+fn shell_integration_uses_utf8_bom(shell: ShellKind) -> bool {
+    #[cfg(windows)]
+    {
+        shell == ShellKind::PowerShell
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = shell;
+        false
+    }
+}
+
+fn write_shell_integration_contents(
+    path: &Path,
+    contents: &str,
+    shell: ShellKind,
+) -> Result<(), String> {
+    if shell_integration_uses_utf8_bom(shell) {
+        let mut bytes = Vec::with_capacity(contents.len() + 3);
+        bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        bytes.extend_from_slice(contents.as_bytes());
+        fs::write(path, bytes)
+    } else {
+        fs::write(path, contents)
+    }
+    .map_err(|error| format!("写入 Shell 启动配置失败（{}）: {error}", path.display()))
+}
+
 fn write_shell_integration(path: &Path, shell: ShellKind) -> Result<bool, String> {
-    let contents = match fs::read_to_string(path) {
+    let mut contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
         Err(error) => {
@@ -722,6 +750,10 @@ fn write_shell_integration(path: &Path, shell: ShellKind) -> Result<bool, String
             ));
         }
     };
+    let had_utf8_bom = contents.starts_with('\u{feff}');
+    if had_utf8_bom {
+        contents.remove(0);
+    }
     let legacy_command = shell.legacy_integration_command();
     let without_legacy_loader = contents
         .split_inclusive('\n')
@@ -755,7 +787,7 @@ fn write_shell_integration(path: &Path, shell: ShellKind) -> Result<bool, String
         updated.push_str(&integration);
     }
 
-    if updated == contents {
+    if updated == contents && (!shell_integration_uses_utf8_bom(shell) || had_utf8_bom) {
         return Ok(false);
     }
     if let Some(parent) = path.parent() {
@@ -763,8 +795,7 @@ fn write_shell_integration(path: &Path, shell: ShellKind) -> Result<bool, String
             .map_err(|error| format!("创建 Shell 配置目录失败（{}）: {error}", parent.display()))?;
     }
     let is_new = !path.exists();
-    fs::write(path, updated)
-        .map_err(|error| format!("写入 Shell 启动配置失败（{}）: {error}", path.display()))?;
+    write_shell_integration_contents(path, &updated, shell)?;
     #[cfg(unix)]
     if is_new {
         use std::os::unix::fs::PermissionsExt;
@@ -1921,8 +1952,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn powershell_shell_initialization_parses() {
-        let path = temporary_file_path("powershell-script");
-        fs::write(&path, POWERSHELL_SHELL_INIT).expect("PowerShell script should be written");
+        let path = temporary_file_path("powershell-profile");
+        assert!(
+            write_shell_integration(&path, ShellKind::PowerShell)
+                .expect("PowerShell integration should be written")
+        );
+        let profile = fs::read(&path).expect("PowerShell profile should be readable");
+        assert!(profile.starts_with(&[0xEF, 0xBB, 0xBF]));
+        assert!(
+            !write_shell_integration(&path, ShellKind::PowerShell)
+                .expect("PowerShell integration should already use UTF-8 BOM")
+        );
+
         let escaped_path = path.to_string_lossy().replace('\'', "''");
         let command = format!("& {{ . '{escaped_path}' }}");
         let output = Command::new("powershell")
@@ -1940,7 +1981,7 @@ mod tests {
             "PowerShell parser failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        fs::remove_file(path).expect("temporary PowerShell script should be removed");
+        fs::remove_file(path).expect("temporary PowerShell profile should be removed");
     }
 
     #[test]
