@@ -68,6 +68,12 @@ qn -- -program-with-leading-hyphen argument
 
 For ordinary command arguments, the executable starts the requested program directly. `qn` exits with that command's exit code; a failed notification does not replace it.
 
+## Captured output encoding
+
+For `--attach-output`, qn preserves valid UTF-8 output without conversion. Otherwise it decodes a Unicode byte-order mark when present, uses the known UTF-16LE encoding of Windows PowerShell 5.1 capture files, and on Windows tries the active console output code page before applying legacy-encoding detection. This keeps common PowerShell, CMD, and native-command output readable in the Markdown notification.
+
+Unlabelled, short legacy-encoded output is inherently ambiguous: the same bytes can represent different text under different code pages. qn therefore favors the Windows console code page when one is available; output from a program that emits a different legacy encoding while redirected may still require that program to emit UTF-8.
+
 ## Configuration
 
 `qn init` requires an interactive terminal and writes the configuration file to the platform-native user configuration directory:

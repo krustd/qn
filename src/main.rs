@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
+use chardetng::EncodingDetector;
 use directories::BaseDirs;
+use encoding_rs::{Encoding, UTF_16BE, UTF_16LE};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
@@ -484,6 +486,7 @@ const POWERSHELL_SHELL_INIT: &str = r#"function qn {
     $qn_tempdir = $null
     $qn_stdout = $null
     $qn_stderr = $null
+    $qn_output_encoding = if ($PSVersionTable.PSVersion.Major -lt 6) { "utf-16le" } else { "auto" }
     $global:LASTEXITCODE = 0
     if ($qn_attach) {
         $qn_tempdir = Join-Path ([System.IO.Path]::GetTempPath()) ("qn-" + [guid]::NewGuid().ToString("N"))
@@ -527,7 +530,7 @@ const POWERSHELL_SHELL_INIT: &str = r#"function qn {
     if ($qn_notify) {
         $qn_report = @("__notify", "--command", $qn_display, "--exit-code", "$qn_status", "--elapsed", "$qn_elapsed")
         if ($qn_attach) {
-            $qn_report += @("--stdout-file", $qn_stdout, "--stderr-file", $qn_stderr)
+            $qn_report += @("--stdout-file", $qn_stdout, "--stderr-file", $qn_stderr, "--output-encoding", $qn_output_encoding)
         }
         & $qn_binary @qn_report | Out-Null
     }
@@ -570,6 +573,26 @@ struct ShellReport {
     elapsed_seconds: u64,
     stdout_file: Option<PathBuf>,
     stderr_file: Option<PathBuf>,
+    output_encoding: CapturedOutputEncoding,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CapturedOutputEncoding {
+    #[default]
+    Auto,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl CapturedOutputEncoding {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "utf-16le" => Ok(Self::Utf16Le),
+            "utf-16be" => Ok(Self::Utf16Be),
+            _ => Err(format!("不支持的输出编码：{value}")),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1202,6 +1225,7 @@ fn parse_shell_report(args: impl IntoIterator<Item = String>) -> Result<ShellRep
     let mut elapsed_seconds = None;
     let mut stdout_file = None;
     let mut stderr_file = None;
+    let mut output_encoding = None;
 
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -1230,6 +1254,11 @@ fn parse_shell_report(args: impl IntoIterator<Item = String>) -> Result<ShellRep
                     args.next().ok_or("--stderr-file 后需要一个值")?,
                 ));
             }
+            "--output-encoding" if output_encoding.is_none() => {
+                output_encoding = Some(CapturedOutputEncoding::parse(
+                    &args.next().ok_or("--output-encoding 后需要一个值")?,
+                )?);
+            }
             _ => return Err(format!("未知或重复的通知参数：{argument}")),
         }
     }
@@ -1239,12 +1268,16 @@ fn parse_shell_report(args: impl IntoIterator<Item = String>) -> Result<ShellRep
         (None, None) => (None, None),
         _ => return Err("标准输出和标准错误文件必须同时提供".into()),
     };
+    if output_encoding.is_some() && stdout_file.is_none() {
+        return Err("--output-encoding 只能与输出文件同时提供".into());
+    }
     Ok(ShellReport {
         command: command.ok_or("--command 不能为空")?,
         code: code.ok_or("--exit-code 不能为空")?,
         elapsed_seconds: elapsed_seconds.ok_or("--elapsed 不能为空")?,
         stdout_file,
         stderr_file,
+        output_encoding: output_encoding.unwrap_or_default(),
     })
 }
 
@@ -1268,7 +1301,11 @@ fn notify_shell_report(args: impl IntoIterator<Item = String>) -> Result<(), Str
         (Some(stdout_file), Some(stderr_file)) => {
             let stdout = read_captured_output_file(&stdout_file, "标准输出")?;
             let stderr = read_captured_output_file(&stderr_file, "标准错误")?;
-            Some(command_output_display_bytes(&stdout, &stderr))
+            Some(command_output_display_bytes(
+                &stdout,
+                &stderr,
+                report.output_encoding,
+            ))
         }
         (None, None) => None,
         _ => unreachable!("parse_shell_report ensures output files are paired"),
@@ -1343,12 +1380,60 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn command_output_display(output: &std::process::Output) -> String {
-    command_output_display_bytes(&output.stdout, &output.stderr)
+    command_output_display_bytes(&output.stdout, &output.stderr, CapturedOutputEncoding::Auto)
 }
 
-fn command_output_display_bytes(stdout: &[u8], stderr: &[u8]) -> String {
-    let stdout = String::from_utf8_lossy(stdout);
-    let stderr = String::from_utf8_lossy(stderr);
+fn decode_with_encoding(bytes: &[u8], encoding: &'static Encoding) -> String {
+    let (text, _, _) = encoding.decode(bytes);
+    text.into_owned()
+}
+
+fn decode_windows_code_page(bytes: &[u8], code_page: u16) -> Option<String> {
+    let encoding = codepage::to_encoding(code_page)?;
+    let (text, _, had_errors) = encoding.decode(bytes);
+    (!had_errors).then(|| text.into_owned())
+}
+
+#[cfg(windows)]
+fn windows_console_output_code_page() -> Option<u16> {
+    use windows_sys::Win32::System::Console::GetConsoleOutputCP;
+
+    u16::try_from(unsafe { GetConsoleOutputCP() }).ok()
+}
+
+fn decode_output_bytes(bytes: &[u8], output_encoding: CapturedOutputEncoding) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    match output_encoding {
+        CapturedOutputEncoding::Utf16Le => return decode_with_encoding(bytes, UTF_16LE),
+        CapturedOutputEncoding::Utf16Be => return decode_with_encoding(bytes, UTF_16BE),
+        CapturedOutputEncoding::Auto => {}
+    }
+    if let Some((encoding, _)) = Encoding::for_bom(bytes) {
+        return decode_with_encoding(bytes, encoding);
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    #[cfg(windows)]
+    if let Some(text) = windows_console_output_code_page()
+        .and_then(|code_page| decode_windows_code_page(bytes, code_page))
+    {
+        return text;
+    }
+    let mut detector = EncodingDetector::new();
+    detector.feed(bytes, true);
+    decode_with_encoding(bytes, detector.guess(None, true))
+}
+
+fn command_output_display_bytes(
+    stdout: &[u8],
+    stderr: &[u8],
+    output_encoding: CapturedOutputEncoding,
+) -> String {
+    let stdout = decode_output_bytes(stdout, output_encoding);
+    let stderr = decode_output_bytes(stderr, output_encoding);
     match (stdout.is_empty(), stderr.is_empty()) {
         (true, true) => "（无输出）".to_owned(),
         (false, true) => format!("标准输出：\n{stdout}"),
@@ -1861,6 +1946,53 @@ mod tests {
     }
 
     #[test]
+    fn preserves_valid_utf8_output() {
+        assert_eq!(
+            decode_output_bytes("编译完成\n".as_bytes(), CapturedOutputEncoding::Auto),
+            "编译完成\n"
+        );
+    }
+
+    #[test]
+    fn decodes_unicode_bom_and_explicit_utf16_output() {
+        assert_eq!(
+            decode_output_bytes(
+                &[0xFF, 0xFE, 0x60, 0x4F, 0x7D, 0x59],
+                CapturedOutputEncoding::Auto,
+            ),
+            "你好"
+        );
+        assert_eq!(
+            decode_output_bytes(&[0x60, 0x4F, 0x7D, 0x59], CapturedOutputEncoding::Utf16Le,),
+            "你好"
+        );
+        assert_eq!(
+            decode_output_bytes(&[0x4F, 0x60, 0x59, 0x7D], CapturedOutputEncoding::Utf16Be,),
+            "你好"
+        );
+    }
+
+    #[test]
+    fn detects_gbk_output_when_utf8_is_invalid() {
+        let text = "你好，世界。编码检测应当恢复这段中文输出。";
+        let (encoded, _, had_errors) = encoding_rs::GBK.encode(text);
+
+        assert!(!had_errors);
+        assert_eq!(
+            decode_output_bytes(&encoded, CapturedOutputEncoding::Auto),
+            text
+        );
+    }
+
+    #[test]
+    fn decodes_windows_console_code_page_output() {
+        assert_eq!(
+            decode_windows_code_page(&[0xC4, 0xE3, 0xBA, 0xC3], 936),
+            Some("你好".into())
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn attaches_standard_output_and_error_to_markdown_notification() {
         let options = Options {
@@ -2022,8 +2154,33 @@ mod tests {
                 elapsed_seconds: 42,
                 stdout_file: Some(PathBuf::from("/tmp/qn-stdout")),
                 stderr_file: Some(PathBuf::from("/tmp/qn-stderr")),
+                output_encoding: CapturedOutputEncoding::Auto,
             }
         );
+    }
+
+    #[test]
+    fn parses_explicit_shell_report_output_encoding() {
+        let report = parse_shell_report(
+            [
+                "--command",
+                "Write-Output 你好",
+                "--exit-code",
+                "0",
+                "--elapsed",
+                "1",
+                "--stdout-file",
+                "/tmp/qn-stdout",
+                "--stderr-file",
+                "/tmp/qn-stderr",
+                "--output-encoding",
+                "utf-16le",
+            ]
+            .map(String::from),
+        )
+        .expect("shell report should parse");
+
+        assert_eq!(report.output_encoding, CapturedOutputEncoding::Utf16Le);
     }
 
     #[test]
@@ -2150,6 +2307,8 @@ mod tests {
         assert!(POWERSHELL_SHELL_INIT.contains("Get-Command qn -CommandType Application"));
         assert!(POWERSHELL_SHELL_INIT.contains("Invoke-Expression"));
         assert!(POWERSHELL_SHELL_INIT.contains("$qn_args.ToArray() -join \" \""));
+        assert!(POWERSHELL_SHELL_INIT.contains("--output-encoding"));
+        assert!(POWERSHELL_SHELL_INIT.contains("PSVersionTable.PSVersion.Major -lt 6"));
         assert!(!POWERSHELL_SHELL_INIT.contains("[string[]]$qn_args.ToArray()"));
         assert_eq!(
             ShellKind::from_name("powershell"),
